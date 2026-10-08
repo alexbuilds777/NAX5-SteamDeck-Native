@@ -41,8 +41,114 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/log.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
+}
+
+#include <QElapsedTimer>
+#include <cctype>
+
+// NAX5: route FFmpeg's own log through Qt (chiaki.gui category -> session log) instead
+// of stderr. Only AV_LOG_ERROR and worse pass. Lines that are equal after normalizing
+// numbers (runs of digits and 0x.. hex become '#', e.g. "Could not find ref with POC <n>")
+// within FFMPEG_LOG_DEDUP_MS of the first printed one are counted; the first is printed
+// verbatim, the count is reported when the window expires (checked on every callback and
+// by a 1 s timer, see nax5_av_log_flush_stale) and on detach. Called from decoder threads.
+#define FFMPEG_LOG_DEDUP_MS 5000
+#define FFMPEG_LOG_MAX_PENDING 4096
+static QMutex av_log_mutex;
+// all guarded by av_log_mutex
+static QByteArray av_log_last_key;
+static qint64 av_log_last_line_ms = -1;
+static int av_log_suppressed = 0;
+static QElapsedTimer av_log_clock;
+
+static QByteArray nax5_av_log_normalize(const QByteArray &line)
+{
+    QByteArray out;
+    out.reserve(line.size());
+    for (int i = 0; i < line.size();) {
+        const char c = line.at(i);
+        if (c == '0' && i + 2 < line.size() && (line.at(i + 1) == 'x' || line.at(i + 1) == 'X')
+            && isxdigit((unsigned char)line.at(i + 2))) {
+            i += 2;
+            while (i < line.size() && isxdigit((unsigned char)line.at(i)))
+                i++;
+            out.append('#');
+        } else if (c >= '0' && c <= '9') {
+            while (i < line.size() && line.at(i) >= '0' && line.at(i) <= '9')
+                i++;
+            out.append('#');
+        } else {
+            out.append(c);
+            i++;
+        }
+    }
+    return out;
+}
+
+// Report the suppressed count (if any) and forget the last line. av_log_mutex held.
+static void nax5_av_log_report_suppressed_locked()
+{
+    if (av_log_suppressed > 0)
+        qCWarning(chiakiGui, "ffmpeg: previous message repeated %d more time(s)", av_log_suppressed);
+    av_log_suppressed = 0;
+    av_log_last_key.clear();
+    av_log_last_line_ms = -1;
+}
+
+// av_log_mutex held
+static void nax5_av_log_expire_locked(qint64 now_ms)
+{
+    if (av_log_last_line_ms >= 0 && now_ms - av_log_last_line_ms >= FFMPEG_LOG_DEDUP_MS)
+        nax5_av_log_report_suppressed_locked();
+}
+
+// Cheap periodic check (GUI thread, 1 s timer) so a repeat count is not held back until
+// the next FFmpeg message, which may never come.
+static void nax5_av_log_flush_stale()
+{
+    QMutexLocker lock(&av_log_mutex);
+    if (av_log_clock.isValid())
+        nax5_av_log_expire_locked(av_log_clock.elapsed());
+}
+
+static void nax5_av_log_callback(void *avcl, int level, const char *fmt, va_list vl)
+{
+    // level may carry flags above the low byte (e.g. AV_LOG_C color)
+    if ((level & 0xff) > av_log_get_level())
+        return;
+    // Partial-line state per thread, so pieces from different decoder threads never merge.
+    static thread_local int print_prefix = 1;
+    static thread_local QByteArray pending;      // partial line waiting for its '\n'
+
+    char buf[1024];
+    av_log_format_line(avcl, level, fmt, vl, buf, sizeof(buf), &print_prefix);
+    pending.append(buf);
+    if (!pending.endsWith('\n') && pending.size() < FFMPEG_LOG_MAX_PENDING)
+        return; // ffmpeg emits some messages in pieces
+    while (pending.endsWith('\n') || pending.endsWith('\r'))
+        pending.chop(1);
+    if (pending.isEmpty())
+        return;
+    const QByteArray line = pending;
+    pending.clear();
+    const QByteArray key = nax5_av_log_normalize(line);
+
+    QMutexLocker lock(&av_log_mutex);
+    if (!av_log_clock.isValid())
+        av_log_clock.start();
+    const qint64 now_ms = av_log_clock.elapsed();
+    nax5_av_log_expire_locked(now_ms);
+    if (av_log_last_line_ms >= 0 && key == av_log_last_key) {
+        av_log_suppressed++;
+        return;
+    }
+    nax5_av_log_report_suppressed_locked();
+    av_log_last_key = key;
+    av_log_last_line_ms = now_ms;
+    qCWarning(chiakiGui, "ffmpeg: %s", line.constData());
 }
 
 static inline bool frame_has_planes(const AVFrame *frame)
@@ -152,6 +258,14 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
 {
     nax5ProcessLogStart();
     qt_msg_handler = qInstallMessageHandler(msg_handler);
+    av_log_set_level(AV_LOG_ERROR);
+    av_log_set_callback(nax5_av_log_callback);
+    {
+        auto *av_log_flush_timer = new QTimer(this);
+        av_log_flush_timer->setInterval(1000);
+        connect(av_log_flush_timer, &QTimer::timeout, this, []() { nax5_av_log_flush_stale(); });
+        av_log_flush_timer->start();
+    }
 
     const char *uri = "org.streetpea.chiaking";
     nax5_auth = new Nax5AuthController(this);
@@ -347,6 +461,13 @@ bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_
 
 QmlBackend::~QmlBackend()
 {
+    // Detach the FFmpeg log callback (it logs through Qt into objects torn down below) and
+    // report a pending repeat count before it is lost.
+    av_log_set_callback(av_log_default_callback);
+    {
+        QMutexLocker lock(&av_log_mutex);
+        nax5_av_log_report_suppressed_locked();
+    }
     if (nax5_session)
         nax5_session->prepareShutdown();
     if(session)
@@ -354,6 +475,7 @@ QmlBackend::~QmlBackend()
         chiaki_log_mutex.lock();
         chiaki_log_ctx = nullptr;
         chiaki_log_mutex.unlock();
+        detachSessionFrames();
         session->deleteLater();
         session = nullptr;
     }
@@ -793,6 +915,7 @@ void QmlBackend::checkPsnConnection(const ChiakiErrorCode &err)
                 chiaki_log_mutex.lock();
                 chiaki_log_ctx = nullptr;
                 chiaki_log_mutex.unlock();
+                detachSessionFrames();
                 session->deleteLater();
                 session = nullptr;
                 setDiscoveryEnabled(true);
@@ -805,6 +928,7 @@ void QmlBackend::checkPsnConnection(const ChiakiErrorCode &err)
                 chiaki_log_mutex.lock();
                 chiaki_log_ctx = nullptr;
                 chiaki_log_mutex.unlock();
+                detachSessionFrames();
                 session->deleteLater();
                 session = nullptr;
                 setDiscoveryEnabled(true);
@@ -817,6 +941,7 @@ void QmlBackend::checkPsnConnection(const ChiakiErrorCode &err)
                 chiaki_log_mutex.lock();
                 chiaki_log_ctx = nullptr;
                 chiaki_log_mutex.unlock();
+                detachSessionFrames();
                 session->deleteLater();
                 session = nullptr;
                 setDiscoveryEnabled(true);
@@ -833,6 +958,7 @@ void QmlBackend::psnSessionStart()
         chiaki_log_mutex.lock();
         chiaki_log_ctx = nullptr;
         chiaki_log_mutex.unlock();
+        detachSessionFrames();
         session->deleteLater();
         session = nullptr;
         emit error(tr("Stream failed"), tr("Failed to start Stream Session: %1").arg(e.what()));
@@ -840,6 +966,21 @@ void QmlBackend::psnSessionStart()
     }
 
     sleep_inhibit->inhibit();
+}
+
+void QmlBackend::detachSessionFrames()
+{
+    // Order matters: flag first (presentFrame / the lambda check it), then invalidate
+    // the decoder hand-off; taking the mutex waits for a lambda that is mid-pull.
+    stream_active.storeRelease(0);
+    {
+        QMutexLocker locker(&frame_decoder_mutex);
+        session_generation.fetchAndAddOrdered(1);
+        frame_decoder = nullptr;
+    }
+    // Session over: report a pending FFmpeg repeat count now instead of in the next session.
+    QMutexLocker av_lock(&av_log_mutex);
+    nax5_av_log_report_suppressed_locked();
 }
 
 void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
@@ -1023,8 +1164,23 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         return;
     }
 
-    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, use_opengl_renderer]() {
-        ChiakiFfmpegDecoder *decoder = session->GetFfmpegDecoder();
+    // Publish the decoder for the frame thread under a new generation; the lambda below
+    // never touches `session` directly (the GUI thread nulls and deletes it).
+    quint64 generation;
+    {
+        QMutexLocker locker(&frame_decoder_mutex);
+        frame_decoder = session->GetFfmpegDecoder();
+        generation = session_generation.fetchAndAddOrdered(1) + 1;
+    }
+    stream_active.storeRelease(1);
+    QPointer<StreamSession> session_ptr(session);
+    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, use_opengl_renderer, session_ptr, generation]() {
+        // Holding the mutex for the whole pull keeps detachSessionFrames() (GUI thread,
+        // before deleteLater) from returning while a frame is still being pulled.
+        QMutexLocker locker(&frame_decoder_mutex);
+        if (!stream_active.loadAcquire() || session_generation.loadAcquire() != generation || session_ptr.isNull())
+            return;
+        ChiakiFfmpegDecoder *decoder = frame_decoder;
         if (!decoder) {
             qCCritical(chiakiGui) << "Session has no FFmpeg decoder";
             return;
@@ -1046,10 +1202,30 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             frame.recovered = true;
         }
 
-        QMetaObject::invokeMethod(window, std::bind(&QmlMainWindow::presentFrame, window, frame, frames_lost));
+        if (!stream_active.loadAcquire()) {
+            av_frame_free(&frame.frame);
+            return;
+        }
+        // Re-check on the GUI thread: the session may have been detached / replaced while
+        // the call was queued, and a frame of the old session must not reach the new one.
+        QMetaObject::invokeMethod(this, [this, generation, frame, frames_lost]() mutable {
+            if (session_generation.loadAcquire() != generation || !stream_active.loadAcquire()) {
+                av_frame_free(&frame.frame);
+                return;
+            }
+            window->presentFrame(frame, frames_lost);
+        });
     });
 
-    connect(session, &StreamSession::SessionQuit, this, [this](ChiakiQuitReason reason, const QString &reason_str) {
+    // Upstream bf132abc: a late signal from a previous session must not tear down the current one.
+    // The old session can be dropped without its SessionQuit (PSN connect error, stop, failed
+    // Start) and its queued signals may still arrive after a new session was created. The
+    // QPointer check also covers a new session allocated at the address of a deleted one.
+    StreamSession *session_for_connections = session;
+    connect(session, &StreamSession::SessionQuit, this, [this, session_for_connections, session_ptr](ChiakiQuitReason reason, const QString &reason_str) {
+        if (session_ptr.isNull() || session != session_for_connections)
+            return;
+
         if (nax5ShowsChiakiQuitDialog(Nax5Runtime::operatorMode()) && chiaki_quit_reason_is_error(reason)) {
             QString m = tr("Chiaki Session has quit") + ":\n" + chiaki_quit_reason_string(reason);
             if (!reason_str.isEmpty())
@@ -1067,7 +1243,9 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             logged_hw_transfer_failures.clear();
         }
 
-        session->deleteLater();
+        detachSessionFrames();
+
+        session_for_connections->deleteLater();
         session = nullptr;
         emit sessionChanged(session);
 
@@ -1082,14 +1260,18 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
 #endif
     });
 
-    connect(session, &StreamSession::LoginPINRequested, this, [this, connect_info](bool incorrect) {
+    connect(session, &StreamSession::LoginPINRequested, this, [this, connect_info, session_for_connections, session_ptr](bool incorrect) {
+        if (session_ptr.isNull() || session != session_for_connections)
+            return;
         if (!connect_info.initial_login_pin.isEmpty() && incorrect == false)
-            session->SetLoginPIN(connect_info.initial_login_pin);
+            session_for_connections->SetLoginPIN(connect_info.initial_login_pin);
         else
             emit sessionPinDialogRequested();
     });
 
-    connect(session, &StreamSession::DataHolepunchProgress, this, [this](bool finished) {
+    connect(session, &StreamSession::DataHolepunchProgress, this, [this, session_for_connections, session_ptr](bool finished) {
+        if (session_ptr.isNull() || session != session_for_connections)
+            return;
         if(finished)
         {
             setConnectState(PsnConnectState::DataConnectionFinished);
@@ -1099,12 +1281,20 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             setConnectState(PsnConnectState::DataConnectionStart);
     });
 
-    connect(session, &StreamSession::NicknameReceived, this, &QmlBackend::checkNickname);
+    // checkNickname() may Stop() `session`: only the session that received the nickname.
+    connect(session, &StreamSession::NicknameReceived, this, [this, session_for_connections, session_ptr](QString nickname) {
+        if (session_ptr.isNull() || session != session_for_connections)
+            return;
+        checkNickname(nickname);
+    });
 
     connect(session, &StreamSession::AutoRegistSucceeded, this, &QmlBackend::finishAutoRegister);
 
-    connect(session, &StreamSession::ConnectedChanged, this, [this]() {
-        if (session->IsConnected())
+    connect(session, &StreamSession::ConnectedChanged, this, [this, session_for_connections, session_ptr]() {
+        if (session_ptr.isNull() || session != session_for_connections)
+            return;
+
+        if (session_for_connections->IsConnected())
             setDiscoveryEnabled(false);
     });
     QmlMainWindow *window_ptr = window;
@@ -1130,6 +1320,7 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
                 chiaki_log_mutex.lock();
                 chiaki_log_ctx = nullptr;
                 chiaki_log_mutex.unlock();
+                detachSessionFrames();
                 session->deleteLater();
                 session = nullptr;
                 return;
@@ -1701,6 +1892,8 @@ void QmlBackend::stopAutoConnect()
             chiaki_log_mutex.lock();
             chiaki_log_ctx = nullptr;
             chiaki_log_mutex.unlock();
+
+            detachSessionFrames();
 
             session->deleteLater();
             session = nullptr;
@@ -2331,6 +2524,7 @@ void QmlBackend::updateDiscoveryHosts()
                     chiaki_log_mutex.lock();
                     chiaki_log_ctx = nullptr;
                     chiaki_log_mutex.unlock();
+                    detachSessionFrames();
                     session->deleteLater();
                     session = nullptr;
                 }

@@ -31,6 +31,8 @@ class QmlSettings : public QObject
     Q_PROPERTY(int echoSuppressLevel READ echoSuppressLevel WRITE setEchoSuppressLevel NOTIFY echoSuppressLevelChanged)
 #endif
     Q_PROPERTY(bool showStreamStats READ showStreamStats WRITE setShowStreamStats NOTIFY showStreamStatsChanged)
+    Q_PROPERTY(int streamStatsLayout READ streamStatsLayout WRITE setStreamStatsLayout NOTIFY streamStatsLayoutChanged)
+    Q_PROPERTY(int streamStatsScale READ streamStatsScale WRITE setStreamStatsScale NOTIFY streamStatsScaleChanged)
     Q_PROPERTY(bool streamerMode READ streamerMode WRITE setStreamerMode NOTIFY streamerModeChanged)
     Q_PROPERTY(float hapticOverride READ hapticOverride WRITE setHapticOverride NOTIFY hapticOverrideChanged)
     Q_PROPERTY(int displayTargetContrast READ displayTargetContrast WRITE setDisplayTargetContrast NOTIFY displayTargetContrastChanged)
@@ -48,6 +50,8 @@ class QmlSettings : public QObject
     Q_PROPERTY(int bitrateRemotePS5 READ bitrateRemotePS5 WRITE setBitrateRemotePS5 NOTIFY bitrateRemotePS5Changed)
     Q_PROPERTY(int codecLocalPS5 READ codecLocalPS5 WRITE setCodecLocalPS5 NOTIFY codecLocalPS5Changed)
     Q_PROPERTY(int codecRemotePS5 READ codecRemotePS5 WRITE setCodecRemotePS5 NOTIFY codecRemotePS5Changed)
+    // NAX5: "oled" or "lcd"; writing it applies the profile's stream and colour settings.
+    Q_PROPERTY(QString deviceProfile READ deviceProfile WRITE setDeviceProfile NOTIFY deviceProfileChanged)
     Q_PROPERTY(int audioBufferSize READ audioBufferSize WRITE setAudioBufferSize NOTIFY audioBufferSizeChanged)
     Q_PROPERTY(int audioVolume READ audioVolume WRITE setAudioVolume NOTIFY audioVolumeChanged)
     Q_PROPERTY(QString audioInDevice READ audioInDevice WRITE setAudioInDevice NOTIFY audioInDeviceChanged)
@@ -174,6 +178,10 @@ public:
 
     bool showStreamStats() const;
     void setShowStreamStats(bool enabled);
+    int streamStatsLayout() const;
+    void setStreamStatsLayout(int layout);
+    int streamStatsScale() const;
+    void setStreamStatsScale(int scale);
 
     bool streamerMode() const;
     void setStreamerMode(bool enabled);
@@ -273,6 +281,9 @@ public:
     void setCodecLocalPS5(int codec);
     int codecRemotePS5() const;
     void setCodecRemotePS5(int codec);
+
+    QString deviceProfile() const;
+    void setDeviceProfile(const QString &profile);
 
     int audioBufferSize() const;
     void setAudioBufferSize(int size);
@@ -622,6 +633,8 @@ signals:
     void hapticOverrideChanged();
     void audioVideoDisabledChanged();
     void showStreamStatsChanged();
+    void streamStatsLayoutChanged();
+    void streamStatsScaleChanged();
     void streamerModeChanged();
     void fpsLocalPS4Changed();
     void fpsRemotePS4Changed();
@@ -633,6 +646,7 @@ signals:
     void bitrateRemotePS5Changed();
     void codecLocalPS5Changed();
     void codecRemotePS5Changed();
+    void deviceProfileChanged();
     void displayTargetPeakChanged();
     void displayTargetContrastChanged();
     void displayTargetPrimChanged();

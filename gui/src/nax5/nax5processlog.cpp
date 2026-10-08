@@ -19,7 +19,13 @@
 #include <QStringList>
 #include <QVector>
 #include <QByteArray>
+#include <QCoreApplication>
 #include <QtGlobal>
+#include <QSettings>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 
 #ifndef CHIAKI_VERSION
 #define CHIAKI_VERSION "unknown"
@@ -30,18 +36,41 @@
 #ifndef NAX5_CLIENT_SHA
 #define NAX5_CLIENT_SHA "unknown"
 #endif
+// Build-time identity (gui/cmake/nax5_build_id.cmake). Only the chiaki target defines
+// NAX5_HAVE_BUILD_HEADER; unit tests keep the configure-time NAX5_CLIENT_SHA ("testsha").
+#ifdef NAX5_HAVE_BUILD_HEADER
+#include "nax5_build.h"
+#endif
+#ifndef NAX5_BUILD_SHA
+#define NAX5_BUILD_SHA NAX5_CLIENT_SHA
+#endif
+#ifndef NAX5_BUILD_DESCRIBE
+#define NAX5_BUILD_DESCRIBE NAX5_BUILD_SHA
+#endif
 
 namespace {
 
 const int kKeepLogFiles = 5;
 QMutex g_mutex;
 QString g_path;
+QFile *g_file = nullptr; // kept open between writes, guarded by g_mutex
 bool g_started = false;
+
+// Qt only supports up to "zzz" (milliseconds); the old "zzzzzz" printed the ms twice.
+const QString kDateStampFormat = QStringLiteral("yyyy-MM-dd_HH-mm-ss-zzz");
+const QString kLegacyDateStampFormat = QStringLiteral("yyyy-MM-dd_HH-mm-ss-zzzzzz");
 
 QString dateStamp()
 {
-    static const QString format = QStringLiteral("yyyy-MM-dd_HH-mm-ss-zzzzzz");
-    return QDateTime::currentDateTime().toString(format);
+    return QDateTime::currentDateTime().toString(kDateStampFormat);
+}
+
+QDateTime parseDateStamp(const QString &stamp)
+{
+    QDateTime date = QDateTime::fromString(stamp, kDateStampFormat);
+    if (!date.isValid())
+        date = QDateTime::fromString(stamp, kLegacyDateStampFormat);
+    return date;
 }
 
 void rotateNax5Logs(const QDir &dir)
@@ -55,7 +84,7 @@ void rotateNax5Logs(const QDir &dir)
         QDateTime date;
         const QRegularExpressionMatch match = name_re.match(filename);
         if (match.hasMatch())
-            date = QDateTime::fromString(match.captured(1), QStringLiteral("yyyy-MM-dd_HH-mm-ss-zzzzzz"));
+            date = parseDateStamp(match.captured(1));
         dated.append(qMakePair(filename, date));
     }
     std::sort(dated.begin(), dated.end(), [](const QPair<QString, QDateTime> &a, const QPair<QString, QDateTime> &b) {
@@ -118,7 +147,23 @@ QString nax5ClientVersion()
 
 QString nax5ClientSha()
 {
-    return QStringLiteral(NAX5_CLIENT_SHA);
+    return QStringLiteral(NAX5_BUILD_SHA);
+}
+
+const char *nax5_build_id()
+{
+    return NAX5_BUILD_DESCRIBE;
+}
+
+QString nax5SessionIdBase()
+{
+    static const QString value = []() {
+        const QString env = QString::fromUtf8(qgetenv("NAX5_SESSION_ID")).trimmed();
+        if (!env.isEmpty())
+            return env;
+        return QStringLiteral("local-%1").arg(QCoreApplication::applicationPid());
+    }();
+    return value;
 }
 
 QString nax5OsPlatform()
@@ -177,6 +222,39 @@ QString formatPacketLoss(double value)
 
 } // namespace
 
+// Display adapters with their driver versions, e.g. "Intel(R) UHD Graphics [31.0.101.5186]".
+// A crash in a video driver cannot be judged without knowing which driver it was.
+QString nax5GpuAdapters()
+{
+#ifdef Q_OS_WIN
+    QStringList adapters;
+    DISPLAY_DEVICEW device = {};
+    device.cb = sizeof(device);
+    for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
+    {
+        if (device.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER)
+            continue;
+        QString entry = QString::fromWCharArray(device.DeviceString).trimmed();
+        if (entry.isEmpty())
+            continue;
+        const QString key = QString::fromWCharArray(device.DeviceKey);
+        const QString prefix = QStringLiteral("\\Registry\\Machine\\");
+        if (key.startsWith(prefix, Qt::CaseInsensitive))
+        {
+            const QSettings registry(QStringLiteral("HKEY_LOCAL_MACHINE\\") + key.mid(prefix.size()), QSettings::NativeFormat);
+            const QString version = registry.value(QStringLiteral("DriverVersion")).toString();
+            if (!version.isEmpty())
+                entry += QStringLiteral(" [%1]").arg(version);
+        }
+        if (!adapters.contains(entry))
+            adapters.append(entry);
+    }
+    return adapters.join(QStringLiteral("; "));
+#else
+    return QString();
+#endif
+}
+
 QString nax5BuildInfoText()
 {
     return nax5BuildInfoText(Nax5BuildInfoSnapshot());
@@ -199,6 +277,7 @@ QString nax5BuildInfoText(const Nax5BuildInfoSnapshot &snapshot)
     text += QStringLiteral("os_platform=%1\n").arg(nax5OsPlatform());
     text += QStringLiteral("os_version=%1\n").arg(nax5OsVersion());
     text += QStringLiteral("os_build=%1\n").arg(nax5OsBuild());
+    text += QStringLiteral("gpu_adapters=%1\n").arg(nax5GpuAdapters());
     text += QStringLiteral("locale=%1\n").arg(nax5LocaleName());
     text += nax5NetworkHintText(nax5QueryNetworkHint());
     if (snapshot.has_stream_stats)
@@ -255,20 +334,24 @@ void nax5ProcessLogStart()
     QDir dir(dir_str);
     rotateNax5Logs(dir);
     g_path = dir.absoluteFilePath(QStringLiteral("nax5_%1.log").arg(dateStamp()));
-    QFile file(g_path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+    g_file = new QFile(g_path);
+    if (!g_file->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
     {
+        delete g_file;
+        g_file = nullptr;
         g_path.clear();
         return;
     }
     const QString header = nax5SanitizeProcessLogLine(
-        QStringLiteral("[%1] nax5 process log start version=%2 sha=%3 operator=%4\n")
+        QStringLiteral("[%1] nax5 process log start version=%2 sha=%3 build=%4 session_id=%5 operator=%6\n")
             .arg(QDateTime::currentDateTime().toString(Qt::ISODate),
                  nax5ClientVersion(),
                  nax5ClientSha(),
+                 QString::fromUtf8(nax5_build_id()),
+                 nax5SessionIdBase(),
                  Nax5Runtime::operatorMode() ? QStringLiteral("true") : QStringLiteral("false")));
-    file.write(header.toUtf8());
-    file.flush();
+    g_file->write(header.toUtf8());
+    g_file->flush();
     g_started = true;
 }
 
@@ -278,16 +361,17 @@ void nax5ProcessLogWrite(const char *category, const QString &message)
     if (!cat.startsWith(QLatin1String("nax5")))
         return;
     QMutexLocker lock(&g_mutex);
-    if (!g_started || g_path.isEmpty())
-        return;
-    QFile file(g_path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+    if (!g_started || !g_file)
         return;
     const QString line = nax5SanitizeProcessLogLine(
         QStringLiteral("[%1] [%2] %3\n")
             .arg(QDateTime::currentDateTime().toString(Qt::ISODate), cat, message));
-    file.write(line.toUtf8());
-    file.flush();
+    // Flush every line so the tail is complete after a crash. Callers must keep the rate
+    // low: reports keep only the last kNax5ArchiveTailBytes (256 KB) of this file, so
+    // periodic samples (stream_sample / network_sample) are thinned at the source
+    // (30 s / on anomaly, 60 s / on change) to keep session start, auth and errors in it.
+    g_file->write(line.toUtf8());
+    g_file->flush();
 }
 
 QString nax5ProcessLogPath()

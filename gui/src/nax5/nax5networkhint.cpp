@@ -3,6 +3,7 @@
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMutex>
@@ -56,8 +57,10 @@ ULONG defaultRouteInterfaceIndex()
         const MIB_IPFORWARD_ROW2 &row = table->Table[i];
         if (row.DestinationPrefix.PrefixLength != 0)
             continue;
-        MIB_IPINTERFACE_ROW iface;
-        InitializeIpInterfaceEntry(&iface);
+        // Zero-initialise instead of InitializeIpInterfaceEntry(): that API is a
+        // pure stub under Wine/Proton and calling it aborts the whole process.
+        // GetIpInterfaceEntry() only requires Family + InterfaceIndex to be set.
+        MIB_IPINTERFACE_ROW iface{};
         iface.Family = AF_INET;
         iface.InterfaceIndex = row.InterfaceIndex;
         if (GetIpInterfaceEntry(&iface) != NO_ERROR || !iface.Connected) continue;
@@ -173,8 +176,10 @@ bool defaultRoute(ULONG *interface_index, SOCKADDR_INET *gateway)
     {
         const MIB_IPFORWARD_ROW2 &row = table->Table[i];
         if (row.DestinationPrefix.PrefixLength != 0 || row.NextHop.si_family != AF_INET) continue;
-        MIB_IPINTERFACE_ROW iface;
-        InitializeIpInterfaceEntry(&iface);
+        // Zero-initialise instead of InitializeIpInterfaceEntry(): that API is a
+        // pure stub under Wine/Proton and calling it aborts the whole process.
+        // GetIpInterfaceEntry() only requires Family + InterfaceIndex to be set.
+        MIB_IPINTERFACE_ROW iface{};
         iface.Family = AF_INET;
         iface.InterfaceIndex = row.InterfaceIndex;
         if (GetIpInterfaceEntry(&iface) != NO_ERROR || !iface.Connected) continue;
@@ -288,6 +293,25 @@ QJsonObject networkSampleJson(const QString &session_id, const NetworkSample &sa
     if (sample.wifi_tx_rate_kbps >= 0) json.insert("wifi_tx_rate_kbps", double(sample.wifi_tx_rate_kbps));
     return json;
 }
+
+// network_sample thinning: the worker still samples every 2 s (the summary for the API
+// report accumulates every sample), but the process-log line is written only when the
+// route / adapter / probe result changed or error / discard counters moved, plus a 60 s
+// heartbeat. Byte deltas in a written line cover only that 2 s tick.
+constexpr qint64 kNetworkSampleHeartbeatMs = 60 * 1000;
+
+bool networkSampleNoteworthy(const NetworkSample &sample, const NetworkSample &last_written)
+{
+    return sample.route_changed
+        || sample.available != last_written.available
+        || sample.adapter_type != last_written.adapter_type
+        || sample.rx_link_mbps != last_written.rx_link_mbps
+        || sample.tx_link_mbps != last_written.tx_link_mbps
+        || sample.gateway_probe_attempted != last_written.gateway_probe_attempted
+        || sample.gateway_probe_ok != last_written.gateway_probe_ok
+        || sample.rx_errors_delta || sample.tx_errors_delta
+        || sample.rx_discards_delta || sample.tx_discards_delta;
+}
 }
 
 class Nax5NetworkDiagnostics::Impl
@@ -302,6 +326,8 @@ public:
         void run() override
         {
             InterfaceCounters previous;
+            NetworkSample last_written;
+            QElapsedTimer since_written;
             while (!isInterruptionRequested())
             {
                 const NetworkSample sample = collectNetworkSample(&previous);
@@ -323,8 +349,14 @@ public:
                     }
                     current = owner->value;
                 }
-                nax5ProcessLogWrite("nax5.network", QString::fromUtf8(
-                    QJsonDocument(networkSampleJson(session_id, sample, current)).toJson(QJsonDocument::Compact)));
+                if (!since_written.isValid() || since_written.elapsed() >= kNetworkSampleHeartbeatMs
+                    || networkSampleNoteworthy(sample, last_written))
+                {
+                    nax5ProcessLogWrite("nax5.network", QString::fromUtf8(
+                        QJsonDocument(networkSampleJson(session_id, sample, current)).toJson(QJsonDocument::Compact)));
+                    last_written = sample;
+                    since_written.start();
+                }
                 QMutexLocker lock(&wait_mutex);
                 if (!isInterruptionRequested()) wait_condition.wait(&wait_mutex, 2000);
             }

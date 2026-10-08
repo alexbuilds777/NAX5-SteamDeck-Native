@@ -34,9 +34,14 @@ Q_LOGGING_CATEGORY(nax5SessionLog, "nax5.session")
 namespace {
 constexpr int kHeartbeatIntervalMs = 20 * 1000;
 constexpr int kHeartbeatRetryMs = 5 * 1000;
-constexpr int kNoCapacityBackoffMs = 5 * 1000;
 constexpr int kTelemetryFlushMs = 300;
 constexpr int kTelemetryBatchLimit = 25;
+// stream_sample thinning: the stats are still sampled every 2 s (they feed the API report
+// snapshot), but the process-log line is written every 30 s, plus immediately on an anomaly.
+// The bounded report keeps only the tail of the process log, so a 2 s cadence pushed session
+// start / auth / errors out after ~8 minutes.
+constexpr qint64 kStreamSampleLogIntervalMs = 30 * 1000;
+constexpr qint64 kStreamSampleAnomalyGapMs = 3000;
 
 QString boolDecoderName(const QString &hw_decoder)
 {
@@ -54,6 +59,7 @@ Nax5SessionController::Nax5SessionController(Nax5AuthController *auth, QmlBacken
     , lease_timer(new QTimer(this))
     , heartbeat_timer(new QTimer(this))
     , reserve_backoff_timer(new QTimer(this))
+    , retry_tick_timer(new QTimer(this))
     , telemetry_flush_timer(new QTimer(this))
     , diagnostic_timer(new QTimer(this))
     , report_queue_timer(new QTimer(this))
@@ -95,11 +101,17 @@ Nax5SessionController::Nax5SessionController(Nax5AuthController *auth, QmlBacken
     connect(heartbeat_timer, &QTimer::timeout, this, &Nax5SessionController::sendHeartbeat);
     reserve_backoff_timer->setSingleShot(true);
     connect(reserve_backoff_timer, &QTimer::timeout, this, &Nax5SessionController::stateChanged);
+    retry_tick_timer->setInterval(1000);
+    connect(retry_tick_timer, &QTimer::timeout, this, [this]() {
+        if (!reserve_backoff_timer->isActive())
+            retry_tick_timer->stop();
+        emit retryChanged();
+    });
     telemetry_flush_timer->setSingleShot(true);
     telemetry_flush_timer->setInterval(kTelemetryFlushMs);
     connect(telemetry_flush_timer, &QTimer::timeout, this, &Nax5SessionController::flushTelemetry);
     diagnostic_timer->setInterval(2000);
-    connect(diagnostic_timer, &QTimer::timeout, this, &Nax5SessionController::sampleStreamStats);
+    connect(diagnostic_timer, &QTimer::timeout, this, [this]() { sampleStreamStats(true); });
     report_queue_timer->setInterval(1000);
     connect(report_queue_timer, &QTimer::timeout, this, &Nax5SessionController::serviceDiagnosticQueue);
     report_queue_timer->start();
@@ -294,6 +306,9 @@ void Nax5SessionController::resetLocal()
     pending_terminal.attempts = 0;
     idempotency_key.clear();
     operator_console_code.clear();
+    setRemainingSeconds(-1);
+    setTopUpSuggested(false);
+    closed_reason = QString();
     ignore_cancel_result = false;
     stream_was_connected = false;
     stream_first_frame_seen = false;
@@ -303,6 +318,8 @@ void Nax5SessionController::resetLocal()
     unauth_logout_pending = false;
     heartbeat_timer->stop();
     reserve_backoff_timer->stop();
+    retry_tick_timer->stop();
+    emit retryChanged();
     discardMaterial();
     clearAssignment();
     setError(Nax5SessionErrorNone);
@@ -396,7 +413,7 @@ void Nax5SessionController::flushTelemetry()
     nax5FlushClientEvents(token, api);
 }
 
-void Nax5SessionController::sampleStreamStats()
+void Nax5SessionController::sampleStreamStats(bool from_timer)
 {
     if (!backend) return;
     StreamSession *session = backend->qmlSession();
@@ -414,6 +431,28 @@ void Nax5SessionController::sampleStreamStats()
         diagnostic_duration_ms = diagnostic_clock.elapsed();
         const qint64 gap = diagnostic_duration_ms - diagnostic_last_sample_ms;
         diagnostic_last_sample_ms = diagnostic_duration_ms;
+        if (from_timer && stream_sample_written)
+        {
+            // Anomalies since the last written line: new lost frames, rising packet loss
+            // (loss > 0 and first seen or >= 1.5x the last written value, so a steady lossy
+            // link does not bring back the 2 s cadence), a late tick (GUI stall), or the
+            // bitrate falling below half of the last written value.
+            const bool frames_lost_up = last_frames_lost > stream_sample_written_frames_lost;
+            const bool loss_up = last_avg_packet_loss > 0
+                && (stream_sample_written_packet_loss <= 0
+                    || last_avg_packet_loss >= stream_sample_written_packet_loss * 1.5);
+            const bool late_tick = gap > kStreamSampleAnomalyGapMs;
+            const bool bitrate_drop = stream_sample_written_bitrate_kbps > 0 && last_measured_bitrate_kbps >= 0
+                && last_measured_bitrate_kbps * 2 < stream_sample_written_bitrate_kbps;
+            const bool due = diagnostic_duration_ms - stream_sample_written_ms >= kStreamSampleLogIntervalMs;
+            if (!due && !frames_lost_up && !loss_up && !late_tick && !bitrate_drop)
+                return;
+        }
+        stream_sample_written = true;
+        stream_sample_written_ms = diagnostic_duration_ms;
+        stream_sample_written_frames_lost = last_frames_lost;
+        stream_sample_written_packet_loss = last_avg_packet_loss;
+        stream_sample_written_bitrate_kbps = last_measured_bitrate_kbps;
         QJsonObject metric{{"schema", 2}, {"event", "stream_sample"},
             {"session_id", diagnostic_session_id},
             {"utc", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
@@ -512,6 +551,9 @@ void Nax5SessionController::play()
     if (streamSessionAlive())
         return;
 
+    setTopUpSuggested(false);
+    setRemainingSeconds(-1);
+    closed_reason = QString();
     if (!diagnostic_report_id.isEmpty() && !diagnostic_finalized)
         submitClientReport(Nax5ClientReportKindQuit);
     if (auth && auth->userId() > 0)
@@ -527,6 +569,11 @@ void Nax5SessionController::play()
     diagnostic_clock.invalidate();
     diagnostic_duration_ms = 0;
     diagnostic_last_sample_ms = 0;
+    stream_sample_written = false;
+    stream_sample_written_ms = 0;
+    stream_sample_written_frames_lost = 0;
+    stream_sample_written_packet_loss = 0;
+    stream_sample_written_bitrate_kbps = -1;
     last_decoder.clear();
     last_resolution.clear();
     last_bitrate_kbps.clear();
@@ -707,6 +754,10 @@ void Nax5SessionController::handleTerminalFinished(quint64 request_id, const Nax
         return;
     if (retryTerminalIfNeeded(result))
         return;
+    // The session is over (or no longer retried): show the play time it left.
+    setRemainingSeconds(-1);
+    if (auth && !shutdown_started && result.error != Nax5SessionErrorUnauthenticated)
+        auth->refreshAccount();
     pending_terminal.request_id = 0;
     const bool silent = ignore_cancel_result || pending_terminal.silent || shutdown_started;
     pending_terminal.mutation = Nax5TerminalMutationNone;
@@ -1004,21 +1055,37 @@ void Nax5SessionController::onReserveFinished(quint64 request_id, const Nax5Sess
     clearAssignment();
     update_url = result.update_url;
     setError(result.error);
-        if (result.error == Nax5SessionErrorNoCapacity || result.error == Nax5SessionErrorUserNotEligible || result.error == Nax5SessionErrorUnauthenticated)
+    if (result.error == Nax5SessionErrorInsufficientBalance)
+    {
+        setTopUpSuggested(true);
+        if (auth)
+            auth->refreshAccount();
+    }
+    if (result.error == Nax5SessionErrorNoCapacity || result.error == Nax5SessionErrorConsoleOffline
+        || result.error == Nax5SessionErrorUserNotEligible
+        || result.error == Nax5SessionErrorInsufficientBalance || result.error == Nax5SessionErrorSessionCooldown
+        || result.error == Nax5SessionErrorUnauthenticated)
     {
         setStatusText(errorText(result.error));
-        setState(nax5SessionReduce(session_state, result.error == Nax5SessionErrorNoCapacity ? Nax5GameSessionActionReserveNoCapacity : Nax5GameSessionActionReserveDenied));
-        if (result.error == Nax5SessionErrorNoCapacity)
-        {
-            reserve_backoff_timer->start(kNoCapacityBackoffMs);
-            emit stateChanged();
-        }
-        if (result.error != Nax5SessionErrorUnauthenticated)
+        setState(nax5SessionReduce(session_state, (result.error == Nax5SessionErrorNoCapacity || result.error == Nax5SessionErrorConsoleOffline) ? Nax5GameSessionActionReserveNoCapacity : Nax5GameSessionActionReserveDenied));
+        if (result.error == Nax5SessionErrorNoCapacity || result.error == Nax5SessionErrorConsoleOffline)
+            startReservePause(result.retry_after_seconds);
+        else if (result.error == Nax5SessionErrorSessionCooldown && result.retry_after_seconds > 0)
+            startReservePause(result.retry_after_seconds);
+        // No play time and the cooldown are expected answers, not failures worth a diagnostic report.
+        if (result.error != Nax5SessionErrorUnauthenticated && result.error != Nax5SessionErrorInsufficientBalance
+            && result.error != Nax5SessionErrorSessionCooldown && result.error != Nax5SessionErrorConsoleOffline)
             submitClientReport(Nax5ClientReportKindReserveFail);
         return;
     }
     setStatusText(errorText(result.error));
     setState(nax5SessionReduce(session_state, Nax5GameSessionActionReserveFailed));
+    if (result.error == Nax5SessionErrorRateLimited)
+    {
+        // The server's pause after "no console" is still running: wait it out, nothing to report.
+        startReservePause(result.retry_after_seconds);
+        return;
+    }
     submitClientReport(Nax5ClientReportKindReserveFail);
 }
 
@@ -1099,7 +1166,9 @@ void Nax5SessionController::onCancelFinished(quint64 request_id, const Nax5Sessi
     {
         clearAssignment();
         setError(Nax5SessionErrorNone);
-        setStatusText(QString());
+        // The player left after the server had closed the session: still say why it was closed.
+        setStatusText(closed_reason.isNull() ? QString() : nax5SessionClosedText(closed_reason));
+        setTopUpSuggested(nax5SessionClosedForBalance(closed_reason));
         setState(nax5SessionReduce(session_state, Nax5GameSessionActionCancelSucceeded));
         if (!shutdown_started)
             submitClientReport(Nax5ClientReportKindQuit);
@@ -1204,6 +1273,7 @@ void Nax5SessionController::onStreamFirstFrame()
     diagnostic_stream_connected = true;
     stream_connected_at = QDateTime::currentDateTime();
     diagnostic_clock.start();
+    stream_sample_written = false; // new clock: the next sample is written unconditionally
     network_diagnostics.start(diagnostic_session_id);
     diagnostic_timer->start();
     sampleStreamStats();
@@ -1241,8 +1311,100 @@ void Nax5SessionController::onHeartbeatFinished(quint64 request_id, const Nax5Se
         return;
     if (session_state != Nax5GameSessionStateActive)
         return;
+    if (result.error == Nax5SessionErrorNotFound)
+    {
+        // The server closed this session (play time ran out, admin, expiry) and may hand the console to
+        // someone else: stop the stream, as upstream does.
+        static const bool keep_stream = qEnvironmentVariableIntValue("NAX5_KEEP_STREAM_ON_SERVER_CLOSE") == 1;
+        if (!keep_stream)
+        {
+            endSessionClosedByBackend(result.reason);
+            return;
+        }
+        // NAX5_KEEP_STREAM_ON_SERVER_CLOSE=1, for a player on their own console: keep streaming and show
+        // the reason once the stream ends.
+        if (closed_reason.isNull())
+        {
+            closed_reason = result.reason.isNull() ? QStringLiteral("") : result.reason;
+            qCWarning(nax5SessionLog) << "heartbeat: session closed by the server" << result.reason;
+        }
+        setRemainingSeconds(-1);
+    }
+    if (result.error == Nax5SessionErrorNone)
+    {
+        // A passing 404 must not leave "closed by the server" behind.
+        closed_reason = QString();
+        setRemainingSeconds(result.remaining_seconds);
+    }
     sampleStreamStats();
-    scheduleHeartbeat(result.error == Nax5SessionErrorNone ? kHeartbeatIntervalMs : kHeartbeatRetryMs);
+    // Once closed, keep the normal pace: a 404 every 5 seconds would only fill the log.
+    scheduleHeartbeat(result.error == Nax5SessionErrorNone || !closed_reason.isNull() ? kHeartbeatIntervalMs : kHeartbeatRetryMs);
+}
+
+void Nax5SessionController::endSessionClosedByBackend(const QString &reason)
+{
+    // The backend already ended this session (admin, expiry) and may hand the
+    // console to someone else: stop streaming instead of heartbeating a 404 forever.
+    qCWarning(nax5SessionLog) << "heartbeat: session closed by backend, stopping stream" << reason;
+    // New generation: onStreamQuit still uploads the quit report but posts no /end/.
+    bumpGeneration();
+    heartbeat_timer->stop();
+    heartbeat_request_id = 0;
+    discardMaterial();
+    clearAssignment();
+    setError(Nax5SessionErrorNone);
+    setStatusText(nax5SessionClosedText(reason));
+    setRemainingSeconds(-1);
+    setTopUpSuggested(nax5SessionClosedForBalance(reason));
+    if (auth)
+        auth->refreshAccount();
+    setState(nax5SessionReduce(session_state, Nax5GameSessionActionStreamEnded));
+    if (streamSessionAlive())
+        backend->stopSession(false);
+}
+
+int Nax5SessionController::retrySeconds() const
+{
+    return reserve_backoff_timer->isActive() ? (reserve_backoff_timer->remainingTime() + 999) / 1000 : 0;
+}
+
+void Nax5SessionController::startReservePause(qint64 retry_after_seconds)
+{
+    reserve_backoff_timer->start(nax5ReserveRetryPauseMs(retry_after_seconds));
+    retry_tick_timer->start();
+    emit retryChanged();
+    emit stateChanged();
+}
+
+QString Nax5SessionController::remainingText() const
+{
+    return remaining_seconds < 0 ? QString() : nax5FormatPlayTime(remaining_seconds);
+}
+
+void Nax5SessionController::setRemainingSeconds(qint64 seconds)
+{
+    const int threshold = nax5LowTimeThreshold(remaining_seconds, seconds);
+    if (remaining_seconds != seconds)
+    {
+        remaining_seconds = seconds;
+        emit playTimeChanged();
+    }
+    if (threshold != 0)
+    {
+        // Always emitted, even with the same text: the view shows it again.
+        time_notice = nax5LowTimeNotice(threshold);
+        time_notice_ms = nax5LowTimeNoticeMs(threshold);
+        time_notice_last = threshold == 60;
+        emit timeNoticeChanged();
+    }
+}
+
+void Nax5SessionController::setTopUpSuggested(bool suggested)
+{
+    if (top_up_suggested == suggested)
+        return;
+    top_up_suggested = suggested;
+    emit playTimeChanged();
 }
 
 static Nax5SessionError errorFromQuitReason(ChiakiQuitReason reason)
@@ -1306,7 +1468,12 @@ void Nax5SessionController::onStreamQuit(ChiakiQuitReason reason, const QString 
         if (mutation == Nax5TerminalMutationEnd)
             reportEnd();
         setState(nax5SessionReduce(session_state, Nax5GameSessionActionStreamEnded));
-        setStatusText(QString());
+        // The console ended the stream itself: somebody chose rest mode or power off on it.
+        const bool console_shut_down = reason == CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN;
+        setStatusText(!closed_reason.isNull() ? nax5SessionClosedText(closed_reason)
+            : console_shut_down ? QStringLiteral("Консоль выключили или перевели в режим покоя. Пожалуйста, не выключайте её: после игры просто закройте лаунчер.")
+            : QString());
+        setTopUpSuggested(nax5SessionClosedForBalance(closed_reason));
         operator_test_active = false;
         clearAssignment();
         return;

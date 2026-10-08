@@ -610,8 +610,8 @@ static void *ctrl_thread_func(void *user)
 				}
 				break;
 			}
-			CHIAKI_LOGI(ctrl->session->log, "CTRL RECEIVED");
-			chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_INFO, ctrl->recv_buf + ctrl->recv_buf_size, received);
+			CHIAKI_LOGV(ctrl->session->log, "CTRL RECEIVED");
+			chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_VERBOSE, ctrl->recv_buf + ctrl->recv_buf_size, received);
 		}
 
 
@@ -943,7 +943,7 @@ static void ctrl_message_received_heartbeat_req(ChiakiCtrl *ctrl, uint8_t *paylo
 	if(payload_size != 0)
 		CHIAKI_LOGW(ctrl->session->log, "Ctrl received Heartbeat request with non-empty payload");
 
-	CHIAKI_LOGI(ctrl->session->log, "Ctrl received Heartbeat, sending reply");
+	CHIAKI_LOGV(ctrl->session->log, "Ctrl received Heartbeat, sending reply");
 	ctrl_message_send(ctrl, CTRL_MESSAGE_TYPE_HEARTBEAT_REP, NULL, 0);
 }
 

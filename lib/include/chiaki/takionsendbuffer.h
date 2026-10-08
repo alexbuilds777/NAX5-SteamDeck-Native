@@ -7,6 +7,7 @@
 #include "log.h"
 #include "thread.h"
 #include "seqnum.h"
+#include "nax5counters.h"
 
 #include <stdbool.h>
 
@@ -22,6 +23,7 @@ typedef struct chiaki_takion_send_buffer_t
 {
 	ChiakiLog *log;
 	ChiakiTakion *takion;
+	ChiakiNax5Counters *nax5_counters; // NAX5: copied from takion at init, may be NULL
 
 	ChiakiTakionSendBufferPacket *packets;
 	size_t packets_size; // allocated size
@@ -31,6 +33,10 @@ typedef struct chiaki_takion_send_buffer_t
 	ChiakiCond cond;
 	bool should_stop;
 	ChiakiThread thread;
+
+	// NAX5: "Takion Send Buffer overflow" log rate limit (at most one per second), under mutex
+	uint64_t nax5_overflow_last_log_us;
+	uint32_t nax5_overflow_suppressed;
 } ChiakiTakionSendBuffer;
 
 

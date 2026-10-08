@@ -2,6 +2,7 @@
 
 #include <sessionlog.h>
 #include <chiaki/log.h>
+#include "nax5/nax5processlog.h"
 
 #include <QStandardPaths>
 #include <QDir>
@@ -11,14 +12,43 @@
 #include <QPair>
 #include <QVector>
 #include <QThread>
+#include <QAtomicInt>
+
+// NAX5 buffered session log (see SessionLog::Log)
+#define SESSION_LOG_FLUSH_BYTES (16 * 1024)
+#define SESSION_LOG_FLUSH_MS 1000
+// Qt supports at most "zzz" (milliseconds); the old "zzzzzz" printed the ms twice.
+static const char *const SESSION_LOG_DATE_FORMAT = "yyyy-MM-dd HH:mm:ss.zzz";
+static const char *const SESSION_LOG_FILE_DATE_FORMAT = "yyyy-MM-dd_HH-mm-ss-zzz";
+static const char *const SESSION_LOG_FILE_DATE_FORMAT_LEGACY = "yyyy-MM-dd_HH-mm-ss-zzzzzz";
 
 static void LogCb(ChiakiLogLevel level, const char *msg, void *user);
 static QString SanitizeLogMessage(const QString &msg);
 
+// NAX5_LOG_STDERR=1 echoes the engine log to stdout as upstream did; default off.
+static bool nax5_log_echo_stdout()
+{
+	static const bool enabled = []() {
+		const QByteArray v = qgetenv("NAX5_LOG_STDERR").trimmed();
+		return v == "1";
+	}();
+	return enabled;
+}
+
+// 1-based index of the session log in this process, appended to the session id
+static QString nax5_next_session_id()
+{
+	static QAtomicInt counter(0);
+	const int n = counter.fetchAndAddRelaxed(1) + 1;
+	return QStringLiteral("%1-%2").arg(nax5SessionIdBase()).arg(n);
+}
+
 SessionLog::SessionLog(StreamSession *session, uint32_t level_mask, const QString &filename, bool sanitize)
-	: session(session), shutdown(false), sanitize(sanitize)
+	: session(session), shutdown(false), sanitize(sanitize), echo_stdout(nax5_log_echo_stdout()),
+	session_id(nax5_next_session_id())
 {
 	chiaki_log_init(&log, level_mask, LogCb, this);
+	flush_timer.start();
 
 	if(filename.isEmpty())
 	{
@@ -36,6 +66,14 @@ SessionLog::SessionLog(StreamSession *session, uint32_t level_mask, const QStrin
 		}
 		else
 		{
+			// First line: identity for the wrapper / report tooling. Written raw (no
+			// timestamp, no sanitizer) so that the id stays greppable.
+			{
+				QMutexLocker lock(&file_mutex);
+				write_buf.append(QStringLiteral("NAX5 session_id=%1 build=%2 codec/host omitted\n")
+					.arg(session_id, QString::fromUtf8(nax5_build_id())).toUtf8());
+				FlushLocked();
+			}
 			CHIAKI_LOGI(&log, "Logging to file %s", filename.toLocal8Bit().constData());
 		}
 	}
@@ -60,38 +98,62 @@ void SessionLog::PrepareShutdown()
 	QMutexLocker lock(&file_mutex);
 	if(file)
 	{
-		file->flush();
+		FlushLocked();
 		delete file;
 		file = nullptr;
 	}
 }
 
+void SessionLog::FlushLocked()
+{
+	if(file && !write_buf.isEmpty())
+	{
+		file->write(write_buf);
+		file->flush();
+	}
+	write_buf.clear();
+	flush_timer.restart();
+}
+
+void SessionLog::FlushIfStale()
+{
+	if(shutdown.loadRelaxed())
+		return;
+	QMutexLocker lock(&file_mutex);
+	if(!file || write_buf.isEmpty())
+		return;
+	if(buf_age_timer.isValid() && buf_age_timer.elapsed() >= SESSION_LOG_FLUSH_MS)
+		FlushLocked();
+}
+
 void SessionLog::Log(ChiakiLogLevel level, const char *msg)
 {
 	QString sanitized_msg = sanitize ? SanitizeLogMessage(QString::fromUtf8(msg)) : QString::fromUtf8(msg);
-	QByteArray sanitized_utf8 = sanitized_msg.toUtf8();
-	const char *output_msg = sanitized_utf8.constData();
+
+	if(echo_stdout)
+	{
+		QByteArray sanitized_utf8 = sanitized_msg.toUtf8();
+		chiaki_log_cb_print(level, sanitized_utf8.constData(), nullptr);
+	}
 
 	// Check if we're shutting down - if so, skip file logging
 	if(shutdown.loadRelaxed())
-	{
-		chiaki_log_cb_print(level, output_msg, nullptr);
 		return;
-	}
-
-	chiaki_log_cb_print(level, output_msg, nullptr);
 
 	QMutexLocker lock(&file_mutex);
 	if(file && !shutdown.loadRelaxed())
 	{
-		static const QString date_format = "yyyy-MM-dd HH:mm:ss:zzzzzz";
 		QString str = QString("[%1] [%2] %3\n").arg(
-				QDateTime::currentDateTime().toString(date_format),
+				QDateTime::currentDateTime().toString(QLatin1String(SESSION_LOG_DATE_FORMAT)),
 				QString(chiaki_log_level_char(level)),
 				sanitized_msg);
+		if(write_buf.isEmpty())
+			buf_age_timer.start();
+		write_buf.append(str.toUtf8());
 
-		file->write(str.toLocal8Bit());
-		file->flush();
+		const bool urgent = level == CHIAKI_LOG_WARNING || level == CHIAKI_LOG_ERROR;
+		if(urgent || write_buf.size() > SESSION_LOG_FLUSH_BYTES || flush_timer.elapsed() > SESSION_LOG_FLUSH_MS)
+			FlushLocked();
 	}
 }
 
@@ -205,7 +267,8 @@ QString GetLogBaseDir()
 
 QString CreateLogFilename()
 {
-	static const QString date_format = "yyyy-MM-dd_HH-mm-ss-zzzzzz";
+	static const QString date_format = QLatin1String(SESSION_LOG_FILE_DATE_FORMAT);
+	static const QString date_format_legacy = QLatin1String(SESSION_LOG_FILE_DATE_FORMAT_LEGACY);
 	static const QString session_log_wildcard = "chiaki_session_*.log";
 	static const QRegularExpression session_log_regex("chiaki_session_(.*).log");
 
@@ -222,7 +285,11 @@ QString CreateLogFilename()
 		QDateTime date;
 		auto match = session_log_regex.match(filename);
 		if(match.hasMatch())
+		{
 			date = QDateTime::fromString(match.captured(1), date_format);
+			if(!date.isValid()) // files from before the format fix
+				date = QDateTime::fromString(match.captured(1), date_format_legacy);
+		}
 		return QPair<QString, QDateTime>(filename, date);
 	});
 	std::sort(existing_files_date.begin(), existing_files_date.end(), [](const QPair<QString, QDateTime> &a, const QPair<QString, QDateTime> &b) {

@@ -56,6 +56,65 @@ static void test_eligibility_denied()
     expect(nax5ParseReserveResponse(403, body).error == Nax5SessionErrorUserNotEligible, "eligibility");
 }
 
+static void test_play_time_answers()
+{
+    const Nax5SessionParseResult denied = nax5ParseReserveResponse(403,
+        "{\"code\":\"INSUFFICIENT_BALANCE\",\"message\":\"x\",\"balanceSeconds\":30}");
+    expect(denied.error == Nax5SessionErrorInsufficientBalance && denied.balance_seconds == 30, "no play time is its own error");
+    expect(nax5ParseReserveResponse(429, "{\"code\":\"RATE_LIMITED\",\"reason\":\"SESSION_COOLDOWN\"}").error
+               == Nax5SessionErrorSessionCooldown, "cooldown after the shared limit");
+    expect(nax5ParseReserveResponse(429, "{\"code\":\"RATE_LIMITED\"}").error == Nax5SessionErrorRateLimited, "plain 429 unchanged");
+
+    const char *beat =
+        "{\"session\":{\"id\":\"s\",\"status\":\"ACTIVE\",\"reservedAt\":\"2026-10-05T10:00:00Z\"},"
+        "\"console\":{\"code\":\"PS5\",\"region\":\"MSK\"},\"remainingSeconds\":299}";
+    expect(nax5ParseCancelResponse(200, beat).remaining_seconds == 299, "heartbeat carries the time left");
+    const char *old_beat =
+        "{\"session\":{\"id\":\"s\",\"status\":\"ACTIVE\",\"reservedAt\":\"2026-10-05T10:00:00Z\"},"
+        "\"console\":{\"code\":\"PS5\",\"region\":\"MSK\"},\"remainingSeconds\":null}";
+    expect(nax5ParseCancelResponse(200, old_beat).remaining_seconds == -1, "no time left reported while nothing is charged");
+
+    const Nax5SessionParseResult closed = nax5ParseCancelResponse(404,
+        "{\"code\":\"SESSION_NOT_FOUND\",\"message\":\"x\",\"reason\":\"BALANCE_EXHAUSTED\"}");
+    expect(closed.error == Nax5SessionErrorNotFound && nax5SessionClosedForBalance(closed.reason), "closing answer names the reason");
+    expect(!nax5SessionClosedForBalance(QStringLiteral("SESSION_LIMIT_REACHED")), "shared limit is not a balance stop");
+    expect(nax5SessionClosedText(QString()) == QStringLiteral("Сессия завершена сервером"), "unknown reason keeps the old text");
+
+    expect(nax5FormatPlayTime(4320) == QStringLiteral("1 ч 12 мин"), "format hours and minutes");
+    expect(nax5FormatPlayTime(3600) == QStringLiteral("1 ч"), "format whole hours");
+    expect(nax5FormatPlayTime(599) == QStringLiteral("9 мин"), "format never rounds up");
+    expect(nax5LowTimeThreshold(320, 300) == 300, "five minute warning");
+    expect(nax5LowTimeThreshold(300, 280) == 0, "five minute warning only once");
+    expect(nax5LowTimeThreshold(80, 60) == 60, "one minute warning");
+    expect(nax5LowTimeThreshold(-1, 200) == 300, "a session that starts short warns at once");
+    expect(nax5LowTimeThreshold(-1, 4000) == 0, "no warning with plenty of time");
+    expect(nax5LowTimeThreshold(620, 600) == 600, "ten minute warning");
+    expect(nax5LowTimeThreshold(600, 580) == 0, "ten minute warning only once");
+    expect(nax5LowTimeThreshold(-1, 500) == 600, "a session that starts under ten minutes says so");
+    expect(nax5LowTimeThreshold(700, 250) == 300, "a jump over two marks shows the nearer one");
+    expect(nax5LowTimeNoticeMs(600) == 6000 && nax5LowTimeNoticeMs(300) == 8000 && nax5LowTimeNoticeMs(60) == 10000, "notice durations");
+    expect(nax5LowTimeNotice(300) == QStringLiteral("Осталось 5 минут. Найдите место для сохранения"), "five minute text");
+    expect(nax5LowTimeThreshold(100, -1) == 0, "no warning when time is not reported");
+    expect(nax5ConsoleStatusText(QStringLiteral("busy"), 900, false) == QStringLiteral("Консоль занята. Освободится через 15 мин"), "busy console says when it gets free");
+    expect(nax5ConsoleStatusText(QStringLiteral("busy"), 10800, false) == QStringLiteral("Консоль занята. Освободится через 3 ч"), "long wait is said as it is");
+    expect(nax5ConsoleStatusText(QStringLiteral("busy"), -1, false) == QStringLiteral("Консоль занята другим игроком"), "busy without an estimate");
+    expect(nax5ConsoleStatusText(QStringLiteral("free"), -1, true).contains(QStringLiteral("освободилась")), "freed console is announced");
+    expect(nax5ConsoleStatusText(QString(), -1, false).isEmpty(), "old backend: no console line");
+}
+
+static void test_build16_decisions()
+{
+    expect(nax5ReserveRetryPauseMs(-1) == 60000, "default pause matches the server's minute");
+    expect(nax5ReserveRetryPauseMs(20) == 20000, "the server's own pause wins");
+    expect(nax5ReserveRetryPauseMs(100000) == 600000, "an absurd pause is capped");
+    const Nax5SessionParseResult busy = nax5ParseReserveResponse(409, "{\"code\":\"NO_CAPACITY\",\"retryAfterSeconds\":45}");
+    expect(busy.error == Nax5SessionErrorNoCapacity && busy.retry_after_seconds == 45, "no capacity carries the pause");
+    expect(nax5ParseReserveResponse(429, "{\"code\":\"RATE_LIMITED\",\"retryAfterSeconds\":12}").retry_after_seconds == 12, "429 carries the pause");
+    expect(nax5ParseReserveResponse(409, "{\"code\":\"NO_CAPACITY\"}").retry_after_seconds == -1, "older server: no pause sent");
+    const Nax5SessionParseResult off = nax5ParseReserveResponse(409, "{\"code\":\"CONSOLE_OFFLINE\",\"retryAfterSeconds\":60}");
+    expect(off.error == Nax5SessionErrorConsoleOffline && off.retry_after_seconds == 60, "a switched-off console is its own answer");
+}
+
 static void test_unauthenticated()
 {
     expect(nax5ParseReserveResponse(401, "{\"code\":\"UNAUTHENTICATED\"}").error == Nax5SessionErrorUnauthenticated, "401");
@@ -145,7 +204,7 @@ static void test_state_transitions_and_double_click()
 static void test_user_facing_errors_and_no_leak()
 {
     const QString no_capacity = nax5SessionErrorMessage(Nax5SessionErrorNoCapacity);
-    expect(no_capacity.contains(QStringLiteral("заняты")), "capacity message");
+    expect(no_capacity.contains(QStringLiteral("занята")), "capacity message");
     expect(!no_capacity.contains(QStringLiteral("HTTP")), "no http");
     expect(!no_capacity.contains(QStringLiteral("409")), "no status code");
     expect(!nax5SessionPayloadLooksLeaky(kReserved), "clean payload");
@@ -229,6 +288,9 @@ static void test_shutdown_and_stale_lifecycle()
     expect(nax5AcceptSessionIdentity(QStringLiteral("session-a"), QStringLiteral("session-a")), "same session");
     expect(!nax5AcceptSessionIdentity(QStringLiteral("session-b"), QStringLiteral("session-a")), "session b ignores a");
     expect(nax5TerminalRetryLimit() >= 2, "bounded retries");
+    expect(nax5StreamRetryDelayMs(0) >= 250, "stream retry waits at least 250 ms");
+    expect(nax5StreamRetryDelayMs(10000) >= 500 && nax5StreamRetryDelayMs(10000) <= 2000, "later stream retries about once a second");
+    expect(20000 / nax5StreamRetryDelayMs(0) <= 40, "at most ~40 session requests in the 20 s retry window");
     expect(nax5ShutdownGraceMs() > 0 && nax5ShutdownGraceMs() <= 1000, "short shutdown window");
     expect(nax5ShutdownReportGraceMs() >= 5000 && nax5ShutdownReportGraceMs() <= 15000, "report upload shutdown window");
 }
@@ -358,6 +420,8 @@ int main()
     test_reserve_success();
     test_no_capacity();
     test_eligibility_denied();
+    test_play_time_answers();
+    test_build16_decisions();
     test_unauthenticated();
     test_required_update();
     test_conflict_and_rate_limit_and_server();

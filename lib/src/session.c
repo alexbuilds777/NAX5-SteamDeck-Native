@@ -1190,3 +1190,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_go_home(ChiakiSession *session)
 	err = ctrl_message_go_home(&session->ctrl);
 	return err;
 }
+
+CHIAKI_EXPORT void chiaki_session_get_nax5_counters(ChiakiSession *session, ChiakiNax5Counters *out)
+{
+	chiaki_nax5_counters_snapshot(&session->nax5_counters, out);
+}

@@ -10,6 +10,8 @@
 #include <QMap>
 #include <QString>
 #include <QTimer>
+#include <QElapsedTimer>
+#include <QAtomicInteger>
 
 #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
 #include <SDL.h>
@@ -37,6 +39,15 @@ class ControllerManager : public QObject
 		bool is_app_active;
 		bool moved;
 		uint8_t dualsense_intensity;
+		// NAX5: GUI stall detection, gap between HandleEvents ticks minus the interval
+		QElapsedTimer handle_events_timer;
+		QAtomicInteger<quint32> gui_stall_max_ms{0};
+		// NAX5 input latency bound: monotonic µs (chiaki_time_now_monotonic_us) at the start
+		// of the previous / current HandleEvents tick. An event delivered by the current
+		// tick's SDL_PollEvent pass happened after the previous pass drained the queue, i.e.
+		// no earlier than prev_tick_start_us. 0 = no previous tick yet.
+		quint64 prev_tick_start_us = 0;
+		quint64 cur_tick_start_us = 0;
 
 		void ControllerClosed(Controller *controller);
 		void CheckMoved();
@@ -61,6 +72,9 @@ class ControllerManager : public QObject
 		void creatingControllerMapping(bool creating_controller_mapping);
 		QSet<int> GetAvailableControllers();
 		Controller *OpenController(int device_id);
+		// NAX5: max (gap between HandleEvents ticks - UPDATE_INTERVAL_MS) since the last
+		// call, in ms; then reset. 0 when the event loop kept up.
+		quint32 TakeGuiStallMaxMs() { return gui_stall_max_ms.fetchAndStoreRelaxed(0); }
 
 	signals:
 		void AvailableControllersUpdated();
@@ -85,7 +99,11 @@ class Controller : public QObject
 		bool HandleSensorEvent(SDL_ControllerSensorEvent event);
 		bool HandleTouchpadEvent(SDL_ControllerTouchpadEvent event);
 #endif
+		bool WouldUndoPendingChange(const SDL_Event &event);
 #endif
+		// NAX5: emits StateChanged if events were applied since the last emission
+		// (coalesced input, see NAX5_COALESCE_INPUT in controllermanager.cpp)
+		void FlushState();
 
 		int ref;
 		ControllerManager *manager;
@@ -102,6 +120,15 @@ class Controller : public QObject
 		bool has_led;
 		bool micbutton_push;
 		uint16_t firmware_version;
+		bool state_dirty;
+		ChiakiControllerState emitted_state;
+		// NAX5 input latency: earliest possible occurrence time (monotonic µs = start of the
+		// HandleEvents tick before the one that polled the event) of the oldest event folded
+		// into the pending state, moved to the emitted slot when StateChanged fires.
+		bool has_pending_event_poll;
+		quint64 pending_event_poll_us;
+		bool has_emitted_event_poll;
+		quint64 emitted_event_poll_us;
 
 #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
 		QMap<QPair<Sint64, Sint64>, uint8_t> touch_ids;
@@ -128,6 +155,10 @@ class Controller : public QObject
 		bool IsPS();
 		QString GetGUIDString();
 		ChiakiControllerState GetState();
+		// NAX5: earliest possible occurrence time (monotonic µs, previous poll tick start) of
+		// the oldest event behind the last StateChanged; true once per emission, then cleared.
+		// Not available (false) for events of the very first tick.
+		bool TakeLastEventPollUs(quint64 *since_us);
 		void SetRumble(uint8_t left, uint8_t right);
 		void SetTriggerEffects(uint8_t type_left, const uint8_t *data_left, uint8_t type_right, const uint8_t *data_right);
 		void SetDualsenseMic(bool on);

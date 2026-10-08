@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
 
 #include <chiaki/congestioncontrol.h>
+#include <chiaki/time.h>
+
+#include "takion_nax5.h"
 
 #define CONGESTION_CONTROL_INTERVAL_MS 200
+// NAX5: the clamp line is per report (5/s); summarize it at most once per 10 s.
+#define CONGESTION_CLAMP_LOG_INTERVAL_US (10 * 1000 * 1000)
 
 static void *congestion_control_thread_func(void *user)
 {
@@ -25,10 +30,19 @@ static void *congestion_control_thread_func(void *user)
 		ChiakiTakionCongestionPacket packet = { 0 };
 		uint64_t total = received + lost;
 		control->packet_loss = total > 0 ? (double)lost / total : 0;
+		// NAX5: takion->nax5_counters is set from the stream thread, hence the acquire load
+		ChiakiNax5Counters *ctr = __atomic_load_n(&control->takion->nax5_counters, __ATOMIC_ACQUIRE);
+		CHIAKI_NAX5_INC(ctr, congestion_reports);
 		if(control->packet_loss > control->packet_loss_max)
 		{
-			CHIAKI_LOGD(control->takion->log, "Clamping reported packet loss: measured=%.1f%% reported_max=%.1f%%",
-				control->packet_loss * 100.0, control->packet_loss_max * 100.0);
+			CHIAKI_NAX5_INC(ctr, congestion_loss_clamped);
+			control->clamp_since_log++;
+			if(nax5_takion_ratelimit(&control->clamp_log_last_us, chiaki_time_now_monotonic_us(), CONGESTION_CLAMP_LOG_INTERVAL_US))
+			{
+				CHIAKI_LOGI(control->takion->log, "Clamping reported packet loss: measured=%.1f%% reported_max=%.1f%% (%u report(s) clamped since last line)",
+					control->packet_loss * 100.0, control->packet_loss_max * 100.0, (unsigned int)control->clamp_since_log);
+				control->clamp_since_log = 0;
+			}
 			lost = total * control->packet_loss_max;
 			received = total - lost;
 		}
@@ -49,6 +63,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_congestion_control_start(ChiakiCongestionCo
 	control->stats = stats;
 	control->packet_loss_max = packet_loss_max;
 	control->packet_loss = 0;
+	control->clamp_log_last_us = 0;
+	control->clamp_since_log = 0;
 
 	ChiakiErrorCode err = chiaki_bool_pred_cond_init(&control->stop_cond);
 	if(err != CHIAKI_ERR_SUCCESS)

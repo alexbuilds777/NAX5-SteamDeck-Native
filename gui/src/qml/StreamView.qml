@@ -16,7 +16,7 @@ Item {
     property bool sessionLoading: !Chiaki.window.hasVideo
     property list<Item> restoreFocusItems
     readonly property bool useSeparateMenuWindow: Chiaki.window.runtimeRendererBackend === 1
-    readonly property int streamMenuHeight: 200
+    readonly property int streamMenuHeight: 260
     readonly property bool streamStatsVisible: Chiaki.settings.showStreamStats && !(menuController.open || menuController.closing) && !sessionLoading && !sessionError && !(Chiaki.settings.audioVideoDisabled & 0x02)
     property int separateMenuX: 0
     property int separateMenuY: 0
@@ -27,6 +27,49 @@ Item {
     property int separateStatsHeight: 0
     property int separateDialogX: 0
     property int separateDialogY: 0
+    // NAX5: how long the session has been running, shown in the stream stats
+    property double sessionStartMs: 0
+    property int sessionMinutes: 0
+    readonly property bool sessionConnected: Chiaki.session ? Chiaki.session.connected : false
+    readonly property string sessionDurationText: {
+        if (!sessionStartMs)
+            return "";
+        const h = Math.floor(sessionMinutes / 60);
+        const m = sessionMinutes % 60;
+        return h > 0 ? qsTr("%1 ч %2 мин").arg(h).arg(m) : qsTr("%1 мин").arg(m);
+    }
+
+    function updateSessionStart() {
+        if (!Chiaki.session)
+            sessionStartMs = 0;
+        else if (sessionConnected && !sessionStartMs)
+            sessionStartMs = Date.now();
+        sessionMinutes = sessionStartMs ? Math.floor((Date.now() - sessionStartMs) / 60000) : 0;
+    }
+
+    onSessionConnectedChanged: updateSessionStart()
+
+    // NAX5: device clock and battery for the stream stats, compact numbers
+    property string clockText: Qt.formatTime(new Date(), "HH:mm")
+    readonly property int batteryPercent: Chiaki.session ? Chiaki.session.batteryPercent : -1
+    readonly property string batteryText: batteryPercent < 0 ? ""
+        : "%1%%2".arg(batteryPercent).arg(Chiaki.session && Chiaki.session.batteryCharging ? "+" : "")
+    readonly property string batteryColor: batteryPercent < 0 ? "#ffffff"
+        : batteryPercent <= 15 ? "#ef9a9a" : batteryPercent <= 30 ? "#ffe082" : "#a5d6a7"
+    Timer {
+        interval: 1000
+        repeat: true
+        running: view.sessionStartMs > 0
+        triggeredOnStart: true
+        onTriggered: view.clockText = Qt.formatTime(new Date(), "HH:mm")
+    }
+
+    Timer {
+        interval: 5000
+        repeat: true
+        running: view.sessionStartMs > 0
+        onTriggered: view.updateSessionStart()
+    }
 
     function grabInput(item) {
         Chiaki.window.grabInput();
@@ -78,6 +121,7 @@ Item {
             sessionLoading = false;
         updateSeparateMenuGeometry();
         raiseSeparateStatsOverlay();
+        updateSessionStart();
     }
     onWidthChanged: {
         updateSeparateMenuGeometry();
@@ -149,12 +193,18 @@ Item {
                 bottom: parent.bottom
             }
 
-            BusyIndicator {
+            // NAX5: only exists while loading. Qt 6.8 Material BusyIndicator keeps its
+            // animated node while `running` (default true) even when hidden, and that node
+            // calls QQuickWindow::update() on every Qt Quick render: renderRequested after
+            // every render for the whole stream, so repeat presents were never skipped.
+            Loader {
                 id: spinner
                 anchors.centerIn: parent
                 width: 70
                 height: width
                 visible: sessionLoading
+                active: sessionLoading
+                sourceComponent: BusyIndicator { }
             }
 
             Label {
@@ -298,11 +348,147 @@ Item {
         Item {
             id: streamStatsContentRoot
             anchors.fill: parent
+            readonly property int statsLayout: Chiaki.settings.streamStatsLayout
+            readonly property real statsScale: Chiaki.settings.streamStatsScale / 100
+
+            // Thin one-line bar at the top or bottom, like the Steam Deck performance overlay.
+            Rectangle {
+                visible: streamStatsContentRoot.statsLayout !== 0
+                anchors {
+                    left: parent.left
+                    right: parent.right
+                    top: streamStatsContentRoot.statsLayout === 1 ? parent.top : undefined
+                    bottom: streamStatsContentRoot.statsLayout === 2 ? parent.bottom : undefined
+                }
+                height: statsBarLabel.implicitHeight + 6 * streamStatsContentRoot.statsScale
+                color: Qt.rgba(0, 0, 0, 0.55)
+
+                Label {
+                    id: statsBarLabel
+                    anchors.centerIn: parent
+                    width: parent.width - 16
+                    horizontalAlignment: Text.AlignHCenter
+                    elide: Text.ElideRight
+                    textFormat: Text.StyledText
+                    font.pixelSize: Math.round(14 * streamStatsContentRoot.statsScale)
+                    text: {
+                        const session = Chiaki.session;
+                        if (!session || !parent.visible)
+                            return "";
+                        const fps = Chiaki.window.streamFps;
+                        const fpsColor = fps >= 55 ? "#a5d6a7" : fps >= 40 ? "#ffe082" : "#ef9a9a";
+                        const loss = isFinite(session.averagePacketLoss) ? session.averagePacketLoss * 100 : 0;
+                        const lost = isFinite(session.framesLost) ? session.framesLost : 0;
+                        const parts = [];
+                        parts.push("<font color=\"%1\"><b>%2</b></font> FPS".arg(fpsColor).arg(fps));
+                        parts.push(qsTr("<b>%1</b> Гц").arg(Chiaki.window.displayFps));
+                        if (Chiaki.window.streamResolution.length > 0)
+                            parts.push(Chiaki.window.streamResolution);
+                        if (session.pingMs > 0)
+                            parts.push(qsTr("<b>%1</b> мс").arg(session.pingMs));
+                        let bitrate = "<b>%1</b>".arg(session.measuredBitrate.toFixed(1));
+                        if (session.targetBitrate > 0)
+                            bitrate += " / %1".arg(session.targetBitrate.toFixed(1));
+                        parts.push(qsTr("%1 Мбит/с").arg(bitrate));
+                        parts.push(qsTr("потери <font color=\"%1\"><b>%2%</b></font>")
+                            .arg(loss >= 1 ? "#ef9a9a" : "#ffffff").arg(loss.toFixed(1)));
+                        parts.push(qsTr("кадры −%1 / −%2").arg(Chiaki.window.droppedFrames).arg(lost));
+                        if (view.sessionDurationText.length > 0)
+                            parts.push("<b>%1</b>".arg(view.sessionDurationText));
+                        parts.push("<b>%1</b>".arg(view.clockText));
+                        if (view.batteryText.length > 0)
+                            parts.push("<font color=\"%1\"><b>%2</b></font>".arg(view.batteryColor).arg(view.batteryText));
+                        return parts.join("&nbsp;&nbsp;·&nbsp;&nbsp;");
+                    }
+                }
+            }
+
             ColumnLayout {
+                visible: streamStatsContentRoot.statsLayout === 0
+                scale: streamStatsContentRoot.statsScale
+                transformOrigin: Item.Right
                 anchors {
                     right: parent.right
                     verticalCenter: parent.verticalCenter
                     rightMargin: 5
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignRight
+                    text: qsTr("fps")
+                    font.pixelSize: 18
+                    visible: Chiaki.session ? true : false
+
+                    Label {
+                        anchors {
+                            right: parent.left
+                            baseline: parent.baseline
+                            rightMargin: 5
+                        }
+                        text: parent.visible ? Chiaki.window.streamFps : ""
+                        color: Chiaki.window.streamFps >= 55 ? "#a5d6a7" : Chiaki.window.streamFps >= 40 ? "#ffe082" : "#ef9a9a"
+                        font.bold: true
+                        font.pixelSize: 28
+                    }
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignRight
+                    text: qsTr("Гц экран")
+                    font.pixelSize: 15
+                    visible: Chiaki.session ? true : false
+
+                    Label {
+                        anchors {
+                            right: parent.left
+                            baseline: parent.baseline
+                            rightMargin: 5
+                        }
+                        text: parent.visible ? Chiaki.window.displayFps : ""
+                        font.bold: true
+                        color: "#90caf9"
+                        font.pixelSize: 18
+                    }
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignRight
+                    text: [Chiaki.window.streamResolution, view.sessionDurationText].filter(t => t.length > 0).join("  ·  ")
+                    font.pixelSize: 15
+                    font.bold: true
+                    color: "#90caf9"
+                    visible: Chiaki.session ? text.length > 0 : false
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignRight
+                    textFormat: Text.StyledText
+                    text: view.batteryText.length > 0
+                        ? "%1  ·  <font color=\"%2\">%3</font>".arg(view.clockText).arg(view.batteryColor).arg(view.batteryText)
+                        : view.clockText
+                    font.pixelSize: 15
+                    font.bold: true
+                    color: "#90caf9"
+                    visible: Chiaki.session ? true : false
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignRight
+                    text: qsTr("мс пинг")
+                    font.pixelSize: 15
+                    visible: Chiaki.session ? Chiaki.session.pingMs > 0 : false
+
+                    Label {
+                        anchors {
+                            right: parent.left
+                            baseline: parent.baseline
+                            rightMargin: 5
+                        }
+                        text: parent.visible ? Chiaki.session.pingMs : ""
+                        font.bold: true
+                        color: "#90caf9"
+                        font.pixelSize: 18
+                    }
                 }
 
                 Label {
@@ -322,6 +508,33 @@ Item {
                         font.bold: true
                         font.pixelSize: 28
                     }
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignRight
+                    text: qsTr("Мбит/с цель консоли")
+                    font.pixelSize: 15
+                    visible: Chiaki.session ? Chiaki.session.targetBitrate > 0 : false
+
+                    Label {
+                        anchors {
+                            right: parent.left
+                            baseline: parent.baseline
+                            rightMargin: 5
+                        }
+                        text: parent.visible ? Chiaki.session.targetBitrate.toFixed(1) : ""
+                        font.bold: true
+                        color: "#90caf9"
+                        font.pixelSize: 18
+                    }
+                }
+
+                Label {
+                    Layout.alignment: Qt.AlignRight
+                    text: Chiaki.session ? Chiaki.session.streamInfo : ""
+                    font.pixelSize: 13
+                    opacity: 0.8
+                    visible: text.length > 0
                 }
 
                 Label {
@@ -497,6 +710,137 @@ Item {
             }
 
             RowLayout {
+                id: streamQuickRow
+                property int bitrateMbps: {
+                    if (Chiaki.settings.bitrateRemotePS5 > 0)
+                        return Math.round(Chiaki.settings.bitrateRemotePS5 / 1000);
+                    switch (Chiaki.settings.resolutionRemotePS5) {
+                    case 1: return 2;
+                    case 2: return 6;
+                    case 3: return 10;
+                    default: return 15;
+                    }
+                }
+                function setBitrate(mbps) {
+                    Chiaki.settings.bitrateRemotePS5 = Math.max(2, Math.min(100, mbps)) * 1000;
+                }
+                anchors {
+                    left: parent.left
+                    top: parent.top
+                    leftMargin: 30
+                    topMargin: 20
+                }
+                spacing: 6
+
+                ToolButton {
+                    id: statsButton
+                    text: Chiaki.settings.showStreamStats ? qsTr("Статистика: вкл") : qsTr("Статистика: выкл")
+                    padding: 10
+                    highlighted: Chiaki.settings.showStreamStats
+                    down: activeFocus
+                    onClicked: Chiaki.settings.showStreamStats = !Chiaki.settings.showStreamStats
+                    KeyNavigation.right: statsLayoutButton
+                    KeyNavigation.down: closeButton
+                    Keys.onReturnPressed: clicked()
+                    Keys.onEscapePressed: menuController.close()
+                }
+
+                ToolButton {
+                    id: statsLayoutButton
+                    text: [qsTr("Вид: панель"), qsTr("Вид: полоса ↑"), qsTr("Вид: полоса ↓")][Chiaki.settings.streamStatsLayout]
+                    padding: 10
+                    down: activeFocus
+                    onClicked: Chiaki.settings.streamStatsLayout = (Chiaki.settings.streamStatsLayout + 1) % 3
+                    KeyNavigation.left: statsButton
+                    KeyNavigation.right: statsScaleButton
+                    KeyNavigation.down: closeButton
+                    Keys.onReturnPressed: clicked()
+                    Keys.onEscapePressed: menuController.close()
+                }
+
+                ToolButton {
+                    id: statsScaleButton
+                    readonly property var steps: [75, 100, 125, 150]
+                    text: qsTr("Размер: %1%").arg(Chiaki.settings.streamStatsScale)
+                    padding: 10
+                    down: activeFocus
+                    onClicked: {
+                        const i = steps.indexOf(Chiaki.settings.streamStatsScale);
+                        Chiaki.settings.streamStatsScale = steps[(i + 1) % steps.length];
+                    }
+                    KeyNavigation.left: statsLayoutButton
+                    KeyNavigation.right: bitrateDownButton
+                    KeyNavigation.down: closeButton
+                    Keys.onReturnPressed: clicked()
+                    Keys.onEscapePressed: menuController.close()
+                }
+
+                ToolSeparator {}
+
+                Label {
+                    text: qsTr("Битрейт:")
+                    font.pixelSize: 16
+                }
+
+                ToolButton {
+                    id: bitrateDownButton
+                    text: "−"
+                    font.pixelSize: 22
+                    padding: 6
+                    down: activeFocus
+                    onClicked: streamQuickRow.setBitrate(streamQuickRow.bitrateMbps - 2)
+                    KeyNavigation.left: statsScaleButton
+                    KeyNavigation.right: bitrateUpButton
+                    KeyNavigation.down: closeButton
+                    Keys.onReturnPressed: clicked()
+                    Keys.onEscapePressed: menuController.close()
+                }
+
+                Label {
+                    Layout.preferredWidth: 110
+                    horizontalAlignment: Text.AlignHCenter
+                    text: Chiaki.settings.bitrateRemotePS5 > 0
+                        ? qsTr("%1 Мбит/с").arg(streamQuickRow.bitrateMbps)
+                        : qsTr("авто (%1)").arg(streamQuickRow.bitrateMbps)
+                    font.bold: true
+                    font.pixelSize: 16
+                }
+
+                ToolButton {
+                    id: bitrateUpButton
+                    text: "+"
+                    font.pixelSize: 22
+                    padding: 6
+                    down: activeFocus
+                    onClicked: streamQuickRow.setBitrate(streamQuickRow.bitrateMbps + 2)
+                    KeyNavigation.left: bitrateDownButton
+                    KeyNavigation.right: bitrateAutoButton
+                    KeyNavigation.down: closeButton
+                    Keys.onReturnPressed: clicked()
+                    Keys.onEscapePressed: menuController.close()
+                }
+
+                ToolButton {
+                    id: bitrateAutoButton
+                    text: qsTr("Авто")
+                    padding: 10
+                    enabled: Chiaki.settings.bitrateRemotePS5 > 0
+                    down: activeFocus
+                    onClicked: Chiaki.settings.bitrateRemotePS5 = 0
+                    KeyNavigation.left: bitrateUpButton
+                    KeyNavigation.down: closeButton
+                    Keys.onReturnPressed: clicked()
+                    Keys.onEscapePressed: menuController.close()
+                }
+
+                Label {
+                    text: qsTr("со след. подключения")
+                    font.pixelSize: 13
+                    opacity: 0.7
+                }
+            }
+
+            RowLayout {
                 anchors {
                     left: parent.left
                     bottom: parent.bottom
@@ -504,6 +848,11 @@ Item {
                     bottomMargin: 40
                 }
                 spacing: 0
+                // NAX5: on the Deck's 1280 px the row is wider than the space left of the
+                // connection info and the last buttons ended up under it / off screen, so shrink
+                // it to fit instead.
+                scale: Math.min(1, (parent.width - 30 - 40 - Math.max(consoleNameLabel.implicitWidth, consoleStatsRow.implicitWidth) - 30) / Math.max(1, implicitWidth))
+                transformOrigin: Item.BottomLeft
 
                 ToolButton {
                     id: closeButton
@@ -519,6 +868,7 @@ Item {
                             root.showMainView();
                     }
                     KeyNavigation.right: volumeSlider
+                    KeyNavigation.up: statsButton
                     Keys.onReturnPressed: clicked()
                     Keys.onEscapePressed: menuController.close()
                 }
@@ -570,6 +920,7 @@ Item {
                 onToggled: Chiaki.session.muted = !Chiaki.session.muted
                 KeyNavigation.left: volumeSlider
                 KeyNavigation.right: zoomButton
+                KeyNavigation.up: statsButton
                 Keys.onReturnPressed: toggled()
                 Keys.onEscapePressed: menuController.close()
             }
@@ -630,7 +981,7 @@ Item {
 
             ToolButton {
                 id: stretchButton
-                Layout.rightMargin: 50
+                Layout.rightMargin: 20
                 text: qsTr("Stretch")
                 padding: 10
                 checkable: true
@@ -724,7 +1075,7 @@ Item {
             ToolButton {
                 id: customButton
                 text: qsTr("Custom")
-                Layout.rightMargin: 40
+                Layout.rightMargin: 20
                 padding: 10
                 checkable: true
                 checked: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
@@ -776,6 +1127,18 @@ Item {
             }
             }
 
+            // NAX5: play time left, for a player who wants to check it without leaving the game.
+            Label {
+                anchors {
+                    right: consoleNameLabel.right
+                    bottom: consoleNameLabel.top
+                    bottomMargin: 44
+                }
+                visible: Nax5Session.remainingText.length > 0
+                // Empty while the menu is closed: a hidden text change still costs an overlay render.
+                text: visible ? qsTr("Осталось игрового времени: <b>%1</b>").arg(Nax5Session.remainingText) : ""
+                font.pixelSize: 18
+            }
             Label {
                 anchors {
                     right: consoleNameLabel.right
@@ -816,6 +1179,7 @@ Item {
                 }
 
                 RowLayout {
+                    id: consoleStatsRow
                     anchors {
                         right: parent.right
                         top: parent.bottom
@@ -1360,6 +1724,10 @@ Item {
             if (sessionPinDialog.opened || sessionStopDialog.opened || separateSessionPinWindow.visible || separateSessionStopWindow.visible)
                 return;
             menuController.toggle();
+        }
+
+        function onStreamStatsToggleRequested() {
+            Chiaki.settings.showStreamStats = !Chiaki.settings.showStreamStats;
         }
     }
     Connections {

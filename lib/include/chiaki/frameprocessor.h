@@ -6,6 +6,8 @@
 #include "common.h"
 #include "takion.h"
 #include "packetstats.h"
+#include "nax5counters.h"
+#include "seqnum.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -42,6 +44,8 @@ typedef struct chiaki_frame_processor_t
 	size_t unit_slots_size;
 	bool flushed; // whether we have already flushed the current frame, i.e. are only interested in stats, not data.
 	ChiakiStreamStats stream_stats;
+	ChiakiSeqNum16 frame_index; // NAX5: frame index of the frame currently in the buffer (for logging)
+	ChiakiNax5Counters *nax5_counters; // NAX5: set by the owner (video receiver), may be NULL
 } ChiakiFrameProcessor;
 
 typedef enum chiaki_frame_flush_result_t {

@@ -13,13 +13,56 @@ DialogView {
     buttonVisible: false
 
     Item {
-        ScrollView {
+        // Keep the focused control on screen while navigating with the D-pad.
+        Window.onActiveFocusItemChanged: {
+            const item = Window.activeFocusItem;
+            if (!item || !flick.contentItem)
+                return;
+            // Scroll to the whole row (label + control), not just the focused control.
+            let row = item;
+            while (row && row.parent !== layout)
+                row = row.parent;
+            if (!row)
+                return;
+            // Also show a heading or hint (a plain Label: has text, takes no focus) right above the row.
+            const rows = layout.children;
+            let index = -1;
+            for (let i = 0; i < rows.length; ++i)
+                if (rows[i] === row)
+                    index = i;
+            let first = row;
+            while (index > 0 && rows[index - 1].visible && rows[index - 1].text !== undefined
+                   && !rows[index - 1].activeFocusOnTab) {
+                first = rows[index - 1];
+                index--;
+            }
+            const maxY = Math.max(0, flick.contentHeight - flick.height);
+            const top = index <= 0 ? 0 : first.mapToItem(flick.contentItem, 0, 0).y - 12;
+            const bottom = row.mapToItem(flick.contentItem, 0, 0).y + row.height + 12;
+            if (top < flick.contentY)
+                flick.contentY = Math.max(0, top);
+            else if (bottom > flick.contentY + flick.height)
+                flick.contentY = Math.min(maxY, bottom - flick.height);
+        }
+
+        Flickable {
+            id: flick
             anchors.fill: parent
-            contentWidth: availableWidth
+            clip: true
+            contentWidth: width
+            contentHeight: layout.implicitHeight + 40
+            flickableDirection: Flickable.VerticalFlick
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {
+                policy: ScrollBar.AlwaysOn
+                visible: flick.contentHeight > flick.height
+            }
 
         ColumnLayout {
-            width: Math.max(0, dialog.width - 48)
+            id: layout
+            width: Math.max(0, flick.width - 48)
             x: 24
+            y: 20
             spacing: 16
 
             Label {
@@ -27,6 +70,27 @@ DialogView {
                 text: qsTr("Качество Remote Play")
                 font.pixelSize: 18
                 font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label { text: qsTr("Устройство") }
+                C.ComboBox {
+                    Layout.fillWidth: true
+                    firstInFocusChain: true
+                    model: [qsTr("Steam Deck OLED"), qsTr("Steam Deck (LCD)")]
+                    currentIndex: Chiaki.settings.deviceProfile === "lcd" ? 1 : 0
+                    onActivated: function(index) { Chiaki.settings.deviceProfile = index === 1 ? "lcd" : "oled" }
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: "#c5c5c5"
+                text: Chiaki.settings.deviceProfile === "lcd"
+                      ? qsTr("Обычная картинка без HDR — для Steam Deck с LCD-экраном.")
+                      : qsTr("HDR-картинка с глубоким чёрным — для Steam Deck OLED.")
             }
 
             RowLayout {
@@ -117,7 +181,6 @@ DialogView {
                 Layout.fillWidth: true
                 text: qsTr("Подробные логи (для beta)")
                 checked: Chiaki.settings.logVerbose
-                firstInFocusChain: true
                 onToggled: Chiaki.settings.logVerbose = checked
             }
 

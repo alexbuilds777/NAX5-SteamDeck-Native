@@ -74,6 +74,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnecti
 	stream_connection->streaminfo_early_buf_size = 0;
 	stream_connection->player_index = 0;
 	memset(stream_connection->led_state, 0, sizeof(stream_connection->led_state));
+	stream_connection->measured_bitrate = 0.0;
+	stream_connection->target_bitrate = 0.0;
 
 	stream_connection->haptic_intensity = Strong;
 	stream_connection->trigger_intensity = Strong;
@@ -211,6 +213,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 	stream_connection->state_finished = false;
 	stream_connection->state_failed = false;
 	err = chiaki_takion_connect(&stream_connection->takion, &takion_info, socket);
+	if(err == CHIAKI_ERR_SUCCESS)
+		chiaki_takion_set_nax5_counters(&stream_connection->takion, &session->nax5_counters); // NAX5
 
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
@@ -701,8 +705,32 @@ static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_co
 			 q.target_bitrate, q.upstream_bitrate,
 			 q.upstream_loss,
 			 q.disable_upstream_audio, q.rtt, q.loss);
+		// NAX5: expose the last report to the stats CSV. q.rtt is the raw console value, unit
+		// unknown, and NOT an RTT: it is a sawtooth (~200 down to 0 about every 15 s) unrelated
+		// to the path RTT. Stored as q.rtt * 1000 in console_rtt_us_last only for diagnostics
+		// (the GUI shows -1 when it is 0); the live RTT is data_rtt_us_* (takionsendbuffer.c).
+		{
+			ChiakiNax5Counters *ctr = &stream_connection->session->nax5_counters;
+			CHIAKI_NAX5_INC(ctr, quality_msgs);
+			double rtt_us = q.rtt * 1000.0;
+			if(!(rtt_us >= 0.0))
+				rtt_us = 0.0;
+			if(rtt_us > (double)UINT32_MAX)
+				rtt_us = (double)UINT32_MAX;
+			CHIAKI_NAX5_SET(ctr, console_rtt_us_last, (uint32_t)(rtt_us + 0.5));
+			CHIAKI_NAX5_SET(ctr, console_loss_last, q.loss > UINT32_MAX ? UINT32_MAX : (uint32_t)q.loss);
+			double upstream_loss_x10000 = (double)q.upstream_loss * 10000.0;
+			if(!(upstream_loss_x10000 >= 0.0))
+				upstream_loss_x10000 = 0.0;
+			if(upstream_loss_x10000 > (double)UINT32_MAX)
+				upstream_loss_x10000 = (double)UINT32_MAX;
+			CHIAKI_NAX5_SET(ctr, console_upstream_loss_x10000_last, (uint32_t)(upstream_loss_x10000 + 0.5));
+			CHIAKI_NAX5_SET(ctr, console_upstream_bitrate_last, q.upstream_bitrate);
+			CHIAKI_NAX5_SET(ctr, console_target_bitrate_last, q.target_bitrate);
+		}
 		stream_connection->measured_bitrate = chiaki_stream_stats_bitrate(&stream_connection->video_receiver->frame_processor.stream_stats, stream_connection->session->connect_info.video_profile.max_fps) / 1000000.0;
 		CHIAKI_LOGV(stream_connection->log, "StreamConnection measured bitrate: %.4f MBit/s", stream_connection->measured_bitrate);
+		stream_connection->target_bitrate = q.target_bitrate / 1000000.0;
 		chiaki_stream_stats_reset(&stream_connection->video_receiver->frame_processor.stream_stats);
 		break;
 	}
@@ -1278,7 +1306,9 @@ CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_corrupt_frame(ChiakiStreamC
 		return CHIAKI_ERR_UNKNOWN;
 	}
 
-	CHIAKI_LOGW(stream_connection->log, "StreamConnection reporting corrupt frame(s) from %u to %u", (unsigned int)start, (unsigned int)end);
+	// NAX5: per-report line demoted to debug; the count goes to the stats CSV instead.
+	CHIAKI_NAX5_INC(&stream_connection->session->nax5_counters, frames_corrupt_reported);
+	CHIAKI_LOGD(stream_connection->log, "StreamConnection reporting corrupt frame(s) from %u to %u", (unsigned int)start, (unsigned int)end);
 	return chiaki_takion_send_message_data(&stream_connection->takion, 1, 2, buf, stream.bytes_written, NULL);
 }
 

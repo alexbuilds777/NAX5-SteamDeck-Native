@@ -44,3 +44,9 @@ site/
 /test-artifacts/
 __pycache__/
 *.pyc
+
+# NAX5 local build artifacts (Steam Deck)
+/AppDir*
+/debdeps
+/userdeps
+/nativedeps

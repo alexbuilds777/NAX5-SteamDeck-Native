@@ -223,7 +223,7 @@ static void test_spaces_and_empty_env_are_controlled()
     expect(!parseBase(&error).isValid(), "invalid characters rejected");
 }
 
-static void test_remembered_login_never_persists_secrets()
+static void test_remembered_login_keeps_password_encrypted()
 {
     QTemporaryDir dir;
     expect(dir.isValid(), "auth settings temp dir");
@@ -234,12 +234,65 @@ static void test_remembered_login_never_persists_secrets()
         QStringLiteral("session-token"));
     expect(nax5AuthRememberEnabled(), "remember preference persists");
     expect(nax5AuthSavedEmail() == QStringLiteral("Tester@Example.com"), "remembered email persists");
-    expect(nax5AuthSavedPassword().isEmpty(), "password is never persisted");
-    expect(nax5AuthSavedSessionToken().isEmpty(), "session token is never persisted");
-    QSettings settings(QSettings::defaultFormat(), QSettings::UserScope,
-        Nax5Runtime::settingsOrganizationName(), Nax5Runtime::settingsApplicationName());
-    expect(!settings.contains(QStringLiteral("auth/password")), "legacy password key removed");
-    expect(!settings.contains(QStringLiteral("auth/session_token")), "legacy token key removed");
+    expect(nax5AuthSavedPassword() == QStringLiteral("plain-password"), "remembered password reads back");
+    expect(nax5AuthSavedSessionToken() == QStringLiteral("session-token"), "session token persists for the next start");
+    {
+        QSettings settings(QSettings::defaultFormat(), QSettings::UserScope,
+            Nax5Runtime::settingsOrganizationName(), Nax5Runtime::settingsApplicationName());
+        expect(!settings.contains(QStringLiteral("auth/password")), "no plain-text password key");
+        const QString stored = settings.value(QStringLiteral("auth/password_enc")).toString();
+        expect(stored.startsWith(QStringLiteral("v1:")), "password stored encrypted");
+        expect(!stored.contains(QStringLiteral("plain-password")), "encrypted value does not contain the password");
+        expect(settings.contains(QStringLiteral("auth/session_token")), "token key kept");
+
+        // A value encrypted elsewhere (other device or user) or tampered with is not accepted.
+        QString tampered = stored;
+        tampered[tampered.size() - 3] = tampered[tampered.size() - 3] == QLatin1Char('A') ? QLatin1Char('B') : QLatin1Char('A');
+        settings.setValue(QStringLiteral("auth/password_enc"), tampered);
+        settings.sync();
+    }
+    expect(nax5AuthSavedPassword().isEmpty(), "tampered password is rejected");
+
+    // A plain-text password from an earlier build is moved to the encrypted key.
+    {
+        QSettings settings(QSettings::defaultFormat(), QSettings::UserScope,
+            Nax5Runtime::settingsOrganizationName(), Nax5Runtime::settingsApplicationName());
+        settings.setValue(QStringLiteral("auth/password"), QStringLiteral("legacy-password"));
+        settings.sync();
+    }
+    expect(nax5AuthSavedPassword() == QStringLiteral("legacy-password"), "legacy password still logs in");
+    {
+        QSettings settings(QSettings::defaultFormat(), QSettings::UserScope,
+            Nax5Runtime::settingsOrganizationName(), Nax5Runtime::settingsApplicationName());
+        expect(!settings.contains(QStringLiteral("auth/password")), "legacy plain-text key removed");
+    }
+    expect(nax5AuthSavedPassword() == QStringLiteral("legacy-password"), "legacy password re-saved encrypted");
+
+    nax5AuthSetRememberEnabled(false);
+    expect(nax5AuthSavedPassword().isEmpty(), "turning remember off forgets the password");
+}
+
+static void test_me_play_time()
+{
+    const char *old_backend =
+        "{\"id\":12,\"email\":\"a@example.com\",\"city\":\"\",\"accessStatus\":\"ACTIVE\",\"emailVerified\":true}";
+    const Nax5MeParseResult before = nax5ParseMeResponse(200, old_backend);
+    expect(before.ok && before.balance_seconds == -1 && !before.billing_enforced, "me without play time still parses");
+    const char *body =
+        "{\"id\":12,\"email\":\"a@example.com\",\"city\":\"\",\"accessStatus\":\"ACTIVE\",\"emailVerified\":true,"
+        "\"balanceSeconds\":4320,\"billingEnforced\":true}";
+    const Nax5MeParseResult result = nax5ParseMeResponse(200, body);
+    expect(result.ok && result.balance_seconds == 4320 && result.billing_enforced, "me carries play time");
+    expect(result.console_state.isEmpty() && result.console_free_in_seconds == -1, "me without console status");
+    const char *busy =
+        "{\"id\":12,\"email\":\"a@example.com\",\"city\":\"\",\"accessStatus\":\"ACTIVE\",\"emailVerified\":true,"
+        "\"consoleState\":\"busy\",\"consoleFreeInSeconds\":900}";
+    const Nax5MeParseResult taken = nax5ParseMeResponse(200, busy);
+    expect(taken.console_state == QStringLiteral("busy") && taken.console_free_in_seconds == 900, "me carries console status");
+    const char *unknown =
+        "{\"id\":12,\"email\":\"a@example.com\",\"city\":\"\",\"accessStatus\":\"ACTIVE\",\"emailVerified\":true,"
+        "\"consoleState\":\"busy\",\"consoleFreeInSeconds\":null}";
+    expect(nax5ParseMeResponse(200, unknown).console_free_in_seconds == -1, "unknown wait stays unknown");
 }
 
 int main()
@@ -263,7 +316,8 @@ int main()
     test_malformed_url_is_controlled_error();
     test_invalid_env_does_not_fall_back_to_production();
     test_spaces_and_empty_env_are_controlled();
-    test_remembered_login_never_persists_secrets();
+    test_remembered_login_keeps_password_encrypted();
+    test_me_play_time();
     if (g_failed)
     {
         std::fprintf(stderr, "%d NAX5 auth tests failed\n", g_failed);

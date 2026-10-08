@@ -15,7 +15,10 @@ set(CHIAKI_UNIT_SOURCES
 				test_log.c
 				test_log.h
 				bitstream.c
-				regist.c)
+				regist.c
+				videoreceiver_nax5.c
+				audioreceiver_nax5.c
+				nax5counters.c)
 
 if(CHIAKI_ENABLE_FFMPEG_DECODER)
 	list(APPEND CHIAKI_UNIT_SOURCES ffmpegdecoder.c)

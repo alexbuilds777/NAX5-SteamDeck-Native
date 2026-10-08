@@ -4,6 +4,7 @@
 #include <chiaki/config.h>
 #include <chiaki/log.h>
 #include <chiaki/thread.h>
+#include <chiaki/nax5counters.h>
 
 #include <stdint.h>
 
@@ -37,6 +38,15 @@ struct chiaki_ffmpeg_decoder_t
 	enum AVPixelFormat hw_pix_fmt;
 	AVBufferRef *hw_device_ctx;
 	bool hdr_enabled;
+	bool nax5_reorder_logged; // has_b_frames logged once per decoder
+	// NAX5 decoder counters: relaxed atomics (__atomic_* / CHIAKI_NAX5_* macros), read by the GUI
+	// without the decoder mutex. All are monotonically increasing since decoder init.
+	uint32_t nax5_eagain_drops;      // frames pulled and dropped because avcodec_send_packet returned EAGAIN
+	uint32_t nax5_frames_decoded;    // frames received from avcodec_receive_frame in pull_frame
+	uint32_t nax5_frames_collapsed;  // intermediate frames discarded by pull_frame's "only the last frame" loop
+	int nax5_has_b_frames;           // codec_context->has_b_frames as logged with the first frame (0 until then)
+	uint64_t nax5_eagain_last_log_us; // rate limiting of the EAGAIN debug log (mutex held)
+	uint32_t nax5_eagain_since_log;   // EAGAIN drops not logged yet (mutex held)
 	ChiakiMutex cb_mutex;
 	ChiakiFfmpegFrameAvailable frame_available_cb;
 	void *frame_available_cb_user;

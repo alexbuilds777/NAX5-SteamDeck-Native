@@ -1,5 +1,8 @@
 
 #include <chiaki/ffmpegdecoder.h>
+
+#include <stdlib.h>
+#include <string.h>
 #include <chiaki/time.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixdesc.h>
@@ -46,6 +49,12 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 	decoder->synthetic_candidate_duration_us = decoder->synthetic_frame_duration_us;
 	decoder->synthetic_last_sample_time_us = 0;
 	decoder->synthetic_candidate_count = 0;
+	decoder->nax5_eagain_drops = 0;
+	decoder->nax5_frames_decoded = 0;
+	decoder->nax5_frames_collapsed = 0;
+	decoder->nax5_has_b_frames = 0;
+	decoder->nax5_eagain_last_log_us = 0;
+	decoder->nax5_eagain_since_log = 0;
 
 	decoder->hw_device_ctx = hw_device_ctx ? av_buffer_ref(hw_device_ctx) : NULL;
 	decoder->hw_pix_fmt = AV_PIX_FMT_NONE;
@@ -102,6 +111,23 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ffmpeg_decoder_init(ChiakiFfmpegDecoder *de
 		CHIAKI_LOGI(log, "Using hardware decoder \"%s\" with pix_fmt=%s", hw_decoder_name, av_get_pix_fmt_name(decoder->hw_pix_fmt));
 	}
 
+	// NAX5: AV_CODEC_FLAG_LOW_DELAY does NOT reduce the output delay of the H.264 or HEVC
+	// decoders in FFmpeg 7.1 (libavcodec 61): neither h264_slice.c nor hevc/hevcdec.c looks at
+	// it; has_b_frames comes from the SPS (num_reorder_frames / num_reorder_pics) and is logged
+	// with the first frame. The flag's only effect is in pthread.c: it disables frame threading
+	// (irrelevant for hwaccel). Kept as a harmless default, NAX5_LOW_DELAY=0 turns it off.
+	{
+		const char *env = getenv("NAX5_LOW_DELAY");
+		if(!env || strcmp(env, "0") != 0)
+			decoder->codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+	}
+	// NAX5: carry the packet's opaque_ref (arrival timestamp) over to the decoded AVFrame.
+	// Available since libavcodec 60 (FFmpeg 6.0); the Debian build uses 61 (FFmpeg 7.1).
+#ifdef AV_CODEC_FLAG_COPY_OPAQUE
+	decoder->codec_context->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+#endif
+	decoder->nax5_reorder_logged = false;
+
 	decoder->codec_context->framerate = decoder->synthetic_framerate;
 	decoder->codec_context->pkt_timebase = decoder->synthetic_time_base;
 	decoder->codec_context->time_base = decoder->synthetic_time_base;
@@ -136,13 +162,14 @@ CHIAKI_EXPORT void chiaki_ffmpeg_decoder_fini(ChiakiFfmpegDecoder *decoder)
 CHIAKI_EXPORT bool chiaki_ffmpeg_decoder_video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
 {
 	ChiakiFfmpegDecoder *decoder = user;
+	uint64_t now_us = chiaki_time_now_monotonic_us(); // arrival time of the frame's last packet
 
 	chiaki_mutex_lock(&decoder->mutex);
 	decoder->frames_lost += frames_lost;
 	decoder->frame_recovered = frame_recovered;
 	if(decoder->synthetic_last_sample_time_us)
 	{
-		double observed_duration_us = (double)(chiaki_time_now_monotonic_us() - decoder->synthetic_last_sample_time_us);
+		double observed_duration_us = (double)(now_us - decoder->synthetic_last_sample_time_us);
 		int64_t delivered_frames = (int64_t)frames_lost + 1;
 		double default_duration_us = chiaki_ffmpeg_decoder_default_frame_duration_us((unsigned int)decoder->synthetic_framerate.num);
 		if(delivered_frames > 1)
@@ -179,7 +206,7 @@ CHIAKI_EXPORT bool chiaki_ffmpeg_decoder_video_sample_cb(uint8_t *buf, size_t bu
 			decoder->synthetic_candidate_count = 0;
 		}
 	}
-	decoder->synthetic_last_sample_time_us = chiaki_time_now_monotonic_us();
+	decoder->synthetic_last_sample_time_us = now_us;
 
 	int64_t synthetic_duration_pts = (int64_t)(decoder->synthetic_frame_duration_us + 0.5);
 	if(synthetic_duration_pts < 1)
@@ -188,6 +215,19 @@ CHIAKI_EXPORT bool chiaki_ffmpeg_decoder_video_sample_cb(uint8_t *buf, size_t bu
 		decoder->synthetic_packet_pts += synthetic_duration_pts * (int64_t)frames_lost;
 
 	AVPacket *packet = av_packet_alloc();
+	if(!packet)
+	{
+		CHIAKI_LOGE(decoder->log, "Failed to alloc AVPacket");
+		chiaki_mutex_unlock(&decoder->mutex);
+		return false;
+	}
+	// NAX5: attach the arrival timestamp; with AV_CODEC_FLAG_COPY_OPAQUE the decoded
+	// AVFrame.opaque_ref carries it (read by the renderer for present-age stats).
+#ifdef AV_CODEC_FLAG_COPY_OPAQUE
+	packet->opaque_ref = av_buffer_alloc(sizeof(uint64_t));
+	if(packet->opaque_ref)
+		memcpy(packet->opaque_ref->data, &now_us, sizeof(now_us));
+#endif
 	packet->data = buf;
 	packet->size = buf_size;
 	packet->pts = decoder->synthetic_packet_pts;
@@ -204,7 +244,17 @@ send_packet:
 	{
 		if(r == AVERROR(EAGAIN))
 		{
-			CHIAKI_LOGW(decoder->log, "AVCodec internal buffer is full, dropping a decoded frame to push new packet");
+			// NAX5: this is a decoder-side drop (renderer did not pull in time), not network loss:
+			// counted in nax5_eagain_drops instead of frames_lost, logged at debug once per 10 s.
+			__atomic_fetch_add(&decoder->nax5_eagain_drops, 1, __ATOMIC_RELAXED);
+			decoder->nax5_eagain_since_log++;
+			if(!decoder->nax5_eagain_last_log_us || now_us - decoder->nax5_eagain_last_log_us >= 10000000)
+			{
+				CHIAKI_LOGD(decoder->log, "AVCodec internal buffer is full, dropping a decoded frame to push new packet (%u drops since last message, %u total)",
+						decoder->nax5_eagain_since_log, __atomic_load_n(&decoder->nax5_eagain_drops, __ATOMIC_RELAXED));
+				decoder->nax5_eagain_since_log = 0;
+				decoder->nax5_eagain_last_log_us = now_us;
+			}
 			AVFrame *frame = av_frame_alloc();
 			if(!frame)
 			{
@@ -218,7 +268,6 @@ send_packet:
 				CHIAKI_LOGE(decoder->log, "Failed to pull frame from full codec buffer");
 				goto hell;
 			}
-			decoder->frames_lost++;
 			goto send_packet;
 		}
 		else
@@ -271,6 +320,19 @@ CHIAKI_EXPORT ChiakiFfmpegFrame chiaki_ffmpeg_decoder_pull_frame(ChiakiFfmpegDec
 			frame = frame_last;
 			break;
 		}
+		// NAX5 counters: every frame received; frame_last (if any) is discarded on the next iteration
+		__atomic_fetch_add(&decoder->nax5_frames_decoded, 1, __ATOMIC_RELAXED);
+		if(frame_last)
+			__atomic_fetch_add(&decoder->nax5_frames_collapsed, 1, __ATOMIC_RELAXED);
+	}
+	if(frame && !decoder->nax5_reorder_logged)
+	{
+		decoder->nax5_reorder_logged = true;
+		__atomic_store_n(&decoder->nax5_has_b_frames, decoder->codec_context->has_b_frames, __ATOMIC_RELAXED);
+		CHIAKI_LOGI(decoder->log, "Decoder reorder delay: has_b_frames=%d (%s), low_delay flag %s",
+			decoder->codec_context->has_b_frames,
+			decoder->codec_context->has_b_frames ? "frames are held back" : "no held frames",
+			(decoder->codec_context->flags & AV_CODEC_FLAG_LOW_DELAY) ? "on" : "off");
 	}
 	*frames_lost = decoder->frames_lost;
 	bool recovered = false;

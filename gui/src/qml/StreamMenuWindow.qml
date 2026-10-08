@@ -91,6 +91,11 @@ Window {
                 bottomMargin: 40
             }
             spacing: 0
+            // NAX5: on the Deck's 1280 px the row is wider than the space left of the
+            // connection info and the last buttons ended up under it / off screen, so shrink
+            // it to fit instead.
+            scale: Math.min(1, (parent.width - 30 - 40 - Math.max(consoleNameLabel.implicitWidth, consoleStatsRow.implicitWidth) - 30) / Math.max(1, implicitWidth))
+            transformOrigin: Item.BottomLeft
 
             ToolButton {
                 id: closeButton
@@ -211,7 +216,7 @@ Window {
 
             ToolButton {
                 id: stretchButton
-                Layout.rightMargin: 50
+                Layout.rightMargin: 20
                 text: qsTr("Stretch")
                 padding: 10
                 checkable: true
@@ -300,7 +305,7 @@ Window {
             ToolButton {
                 id: customButton
                 text: qsTr("Custom")
-                Layout.rightMargin: 40
+                Layout.rightMargin: 20
                 padding: 10
                 checkable: true
                 checked: Chiaki.window.videoPreset == ChiakiWindow.VideoPreset.Custom
@@ -341,6 +346,17 @@ Window {
             }
         }
 
+        // NAX5: play time left, for a player who wants to check it without leaving the game.
+        Label {
+            anchors {
+                right: consoleNameLabel.right
+                bottom: consoleNameLabel.top
+                bottomMargin: 44
+            }
+            visible: Nax5Session.remainingText.length > 0
+            text: qsTr("Осталось игрового времени: <b>%1</b>").arg(Nax5Session.remainingText)
+            font.pixelSize: 18
+        }
         Label {
             anchors {
                 right: consoleNameLabel.right
@@ -380,6 +396,7 @@ Window {
             }
 
             RowLayout {
+                id: consoleStatsRow
                 anchors {
                     right: parent.right
                     top: parent.bottom

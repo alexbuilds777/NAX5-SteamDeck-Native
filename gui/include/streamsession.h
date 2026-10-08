@@ -4,6 +4,7 @@
 #define CHIAKI_STREAMSESSION_H
 
 #include <chiaki/session.h>
+#include <chiaki/nax5counters.h>
 #include <chiaki/opusdecoder.h>
 #include <chiaki/opusencoder.h>
 #include <chiaki/ffmpegdecoder.h>
@@ -31,6 +32,7 @@
 #include "sessionlog.h"
 #include "controllermanager.h"
 #include "settings.h"
+#include "nax5/nax5audiotrim.h"
 
 #include <QObject>
 #include <QImage>
@@ -145,6 +147,18 @@ struct MicBuf
 	uint32_t current_byte;
 };
 
+// NAX5: cumulative GUI-side audio output statistics (StreamSession::GetNax5AudioStats)
+struct Nax5AudioStats
+{
+	quint64 trim_dropped_bytes;  // dropped by the slow standing-latency trim
+	quint64 cap_dropped_bytes;   // dropped by the hard latency cap
+	quint32 queue_clears;        // SDL queue ran away (> 3 device buffers) and was cleared
+	quint32 ring_overflows;      // ring buffer full, oldest audio dropped
+	quint32 starved_polls;       // drain found the SDL queue empty while the ring had data
+	quint32 reopens;             // InitAudio calls after the first
+	int jitter_frames_last;      // audio receiver jitter buffer count, 0 if not available
+};
+
 class StreamSession : public QObject
 {
 	friend class StreamSessionPrivate;
@@ -157,6 +171,12 @@ class StreamSession : public QObject
 	Q_PROPERTY(bool muted READ GetMuted WRITE SetMuted NOTIFY MutedChanged)
 	Q_PROPERTY(bool cantDisplay READ GetCantDisplay NOTIFY CantDisplayChanged)
 	Q_PROPERTY(int framesLost READ GetFramesLost NOTIFY FramesLostChanged)
+	Q_PROPERTY(double targetBitrate READ GetTargetBitrate NOTIFY TargetBitrateChanged)
+	Q_PROPERTY(int pingMs READ GetPingMs NOTIFY PingChanged)
+	// NAX5: device battery for the stream overlay (-1 = unknown), charging flag
+	Q_PROPERTY(int batteryPercent READ GetBatteryPercent NOTIFY BatteryChanged)
+	Q_PROPERTY(bool batteryCharging READ GetBatteryCharging NOTIFY BatteryChanged)
+	Q_PROPERTY(QString streamInfo READ GetStreamInfo CONSTANT)
 
 	private:
 		SessionLog log;
@@ -177,12 +197,23 @@ class StreamSession : public QObject
 		QString host;
 		int audio_volume;
 		double measured_bitrate = 0;
+		double target_bitrate = 0;
+		QString stream_info;
 		double average_packet_loss = 0;
+		int live_ping_ms = 0;
+		int battery_percent = -1;
+		bool battery_charging = false;
+		unsigned overlay_status_ticks = 0;
+		void UpdateOverlayStatus();
 		int32_t frames_lost = 0;
 		int32_t pending_frames_lost = 0;
 		double packet_loss_max = 0;
 		QList<double> packet_loss_history;
 		QAtomicInteger<quint64> decoder_flush_generation{0};
+		QAtomicInteger<int> fec_failures{0};
+		// NAX5 input path counters (GetFeedbackSends / TakeInputLatencyMaxUs)
+		QAtomicInteger<quint32> feedback_sends{0};
+		QAtomicInteger<quint32> input_latency_max_us{0};
 		bool cant_display = false;
 		int haptics_handheld;
 		float rumble_multiplier;
@@ -262,6 +293,34 @@ class StreamSession : public QObject
 		size_t audio_out_ring_write_pos = 0;
 		size_t audio_out_ring_fill = 0;
 		bool audio_out_overflow_logged = false;
+		// NAX5 audio latency cap (NAX5_AUDIO_MAX_MS), guarded by audio_out_ring_mutex
+		unsigned int audio_out_rate = 0;
+		uint64_t audio_out_over_cap_since_ms = 0;
+		uint64_t audio_out_cap_dropped_bytes = 0;          // cumulative
+		uint64_t audio_out_cap_dropped_bytes_reported = 0; // value at the last log line
+		uint64_t audio_out_cap_last_log_ms = 0;
+		// NAX5 slow trim of standing latency (NAX5_AUDIO_HEADROOM_MS), same mutex
+		Nax5AudioTrim audio_out_trim;
+		uint64_t audio_out_trim_dropped_bytes = 0;          // cumulative
+		uint64_t audio_out_trim_dropped_bytes_reported = 0; // value at the last log line
+		uint64_t audio_out_trim_last_log_ms = 0;
+		// NAX5 cumulative audio counters for the stats CSV, same mutex.
+		// Note: these (and the *_dropped_bytes above) are never reset when InitAudio reopens
+		// the device, also not when the reopen changes channels / rate. Byte totals then mix
+		// sample sizes, so converting a cumulative byte total to ms with the current format
+		// is only exact for a session with one audio format; per-interval deltas are fine
+		// except across the reopen itself.
+		uint32_t audio_out_queue_clears = 0;
+		uint32_t audio_out_queue_clears_reported = 0;
+		uint64_t audio_out_queue_clear_last_log_ms = 0;
+		uint32_t audio_out_ring_overflows = 0;
+		uint32_t audio_out_starved_polls = 0;
+		uint32_t audio_out_reopens = 0;
+		bool audio_out_opened_once = false;
+		void EnforceAudioOutCapLocked();
+		void DropOldestAudioLocked(size_t drop);
+		void TrimStandingAudioLocked(uint64_t now_ms, uint64_t queued);
+		void HandleAudioQueueRunaway();
 		QMutex audio_out_drain_mutex;
 		QWaitCondition audio_out_drain_wait;
 		QThread *audio_out_drain_thread = nullptr;
@@ -348,12 +407,35 @@ class StreamSession : public QObject
 		bool GetConnected() { return connected; }
 		double GetMeasuredBitrate()	{ return measured_bitrate; }
 		double GetAveragePacketLoss()	{ return average_packet_loss; }
+		double GetTargetBitrate()	{ return target_bitrate; }
+		// Measured once by Senkusha while connecting; 0 until then.
+		// NAX5: live RTT from data-channel ACKs once sampled, else the Senkusha ping from connect time
+		int GetPingMs() const	{ return connected ? (live_ping_ms > 0 ? live_ping_ms : static_cast<int>((session.rtt_us + 500) / 1000)) : 0; }
+		int GetBatteryPercent() const { return battery_percent; }
+		bool GetBatteryCharging() const { return battery_charging; }
+		QString GetStreamInfo() const	{ return stream_info; }
 		quint64 GetInitialRttUs() const { return session.rtt_us; }
 		quint32 GetMtuIn() const { return session.mtu_in; }
 		quint32 GetMtuOut() const { return session.mtu_out; }
 		quint64 DecoderFlushGeneration() const { return decoder_flush_generation.loadRelaxed(); }
 		int GetFramesLost()		{ return frames_lost; }
+		// For the per-second stats log (QmlMainWindow::writeStreamStatsRow).
+		int GetRequestedBitrateKbps() const	{ return session.connect_info.video_profile.bitrate; }
+		int GetMaxFps() const	{ return session.connect_info.video_profile.max_fps; }
+		QString GetRequestedResolution() const	{ return QStringLiteral("%1x%2").arg(session.connect_info.video_profile.width).arg(session.connect_info.video_profile.height); }
+		double GetInstantPacketLoss() const	{ return session.stream_connection.congestion_control.packet_loss; }
+		int GetFecFailures() const	{ return fec_failures.loadRelaxed(); }
+		// NAX5 stats for the per-second CSV (QmlMainWindow). All thread-safe.
+		ChiakiNax5Counters GetNax5Counters();            // snapshot of the lib counters
+		Nax5AudioStats GetNax5AudioStats();              // cumulative GUI audio stats
+		quint32 GetFeedbackSends()	{ return feedback_sends.loadRelaxed(); } // cumulative controller-state updates handed to the lib (not network packets)
+		quint32 TakeInputLatencyMaxUs()	{ return input_latency_max_us.fetchAndStoreRelaxed(0); } // max (send - previous poll tick start), µs, since last call
+		int GetHasBFrames();                             // from the decoder, -1 when unknown
+		QString GetSessionIdSuffix() const	{ return log.GetSessionId(); } // "<NAX5_SESSION_ID>-<n>"
 		bool GetMuted()	{ return muted; }
+		// NAX5: audio waiting for playback (ring buffer + SDL queue, excluding the
+		// device buffer itself), in milliseconds; 0 when audio is not running
+		int GetAudioQueuedMs();
 		void SetMuted(bool enable)	{ if (enable != muted) ToggleMute(); }
 		void SetAudioVolume(int volume) { audio_volume = volume; }
 		bool GetCantDisplay()	{ return cant_display; }
@@ -394,9 +476,12 @@ class StreamSession : public QObject
 		void AutoRegistSucceeded(const ChiakiRegisteredHost &host);
 		void NicknameReceived(QString nickname);
 		void ConnectedChanged();
+		void PingChanged();
+		void BatteryChanged();
 		void MeasuredBitrateChanged();
 		void AveragePacketLossChanged();
 		void FramesLostChanged();
+		void TargetBitrateChanged();
 		void MutedChanged();
 		void CantDisplayChanged(bool cant_display);
 		void FecFailure();

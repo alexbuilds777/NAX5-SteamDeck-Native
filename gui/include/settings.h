@@ -262,6 +262,13 @@ class Settings : public QObject
 		bool GetShowStreamStats() const            { return settings.value("settings/show_stream_stats", false).toBool(); }
 		void SetShowStreamStats(bool enabled)      { settings.setValue("settings/show_stream_stats", enabled); }
 
+		// 0 = panel on the right, 1 = bar at the top, 2 = bar at the bottom
+		int GetStreamStatsLayout() const           { return qBound(0, settings.value("settings/stream_stats_layout", 0).toInt(), 2); }
+		void SetStreamStatsLayout(int layout)      { settings.setValue("settings/stream_stats_layout", qBound(0, layout, 2)); }
+		// percent
+		int GetStreamStatsScale() const            { return qBound(50, settings.value("settings/stream_stats_scale", 100).toInt(), 200); }
+		void SetStreamStatsScale(int scale)        { settings.setValue("settings/stream_stats_scale", qBound(50, scale, 200)); }
+
 		bool GetStreamerMode() const		{ return settings.value("settings/streamer_mode", false).toBool(); }
 		void SetStreamerMode(bool enabled)	{ settings.setValue("settings/streamer_mode", enabled); }
 
@@ -340,6 +347,9 @@ class Settings : public QObject
 		int GetDisplayTargetTrc() const;
 		void SetDisplayTargetTrc(int trc);
 
+		// NAX5: device profile for the Steam Deck build, "oled" or "lcd"; empty until first chosen.
+		QString GetNax5DeviceProfile() const;
+		void SetNax5DeviceProfile(const QString &profile);
 		int GetDisplayTargetPrim() const;
 		void SetDisplayTargetPrim(int prim);
 

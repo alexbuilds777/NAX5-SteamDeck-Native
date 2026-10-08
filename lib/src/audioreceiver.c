@@ -9,7 +9,7 @@
 #define CHIAKI_AUDIO_JITTER_PREFILL 3
 #define CHIAKI_AUDIO_JITTER_BUFFER_SIZE 8
 
-static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, bool is_haptics, uint8_t *buf, size_t buf_size);
+static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, bool is_haptics, bool is_fec, uint8_t *buf, size_t buf_size);
 static void chiaki_audio_receiver_clear_jitter_buffer(ChiakiAudioReceiver *audio_receiver);
 static bool chiaki_audio_receiver_store_audio_frame_locked(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, const uint8_t *buf, size_t buf_size);
 static int chiaki_audio_receiver_find_audio_slot(const ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index);
@@ -118,28 +118,31 @@ CHIAKI_EXPORT void chiaki_audio_receiver_av_packet(ChiakiAudioReceiver *audio_re
 	if(packet->frame_index > (1 << 15))
 		audio_receiver->frame_index_startup = false;
 
-	for(size_t i = 0; i < source_units_count + fec_units_count; i++)
+	// NAX5: FEC units first. They carry copies of the previous frame(s); processing the source
+	// unit first would deliver frame F (concealing a lost F-1 with PLC) and then discard the
+	// FEC copy of F-1 as too old, so the audio FEC data was never used.
+	for(size_t step = 0; step < (size_t)source_units_count + fec_units_count; step++)
 	{
-		ChiakiSeqNum16 frame_index;
-		if(i < source_units_count)
-			frame_index = packet->frame_index + i;
-		else
+		size_t i = chiaki_audio_receiver_unit_order(step, source_units_count, fec_units_count);
+		bool is_fec = i >= source_units_count;
+		if(is_fec)
 		{
 			size_t fec_index = i - source_units_count;
 			if(audio_receiver->frame_index_startup && packet->frame_index + fec_index < fec_units_count + 1)
 				continue;
-			frame_index = packet->frame_index - fec_units_count + fec_index;
 		}
+		ChiakiSeqNum16 frame_index = chiaki_audio_receiver_unit_frame_index(i, packet->frame_index, source_units_count, fec_units_count);
 
-		chiaki_audio_receiver_frame(audio_receiver, frame_index, packet->is_haptics, packet->data + unit_size * i, unit_size);
+		chiaki_audio_receiver_frame(audio_receiver, frame_index, packet->is_haptics, is_fec, packet->data + unit_size * i, unit_size);
 	}
 
 	if(audio_receiver->packet_stats)
 		chiaki_packet_stats_push_seq(audio_receiver->packet_stats, packet->frame_index);
 }
 
-static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, bool is_haptics, uint8_t *buf, size_t buf_size)
+static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, bool is_haptics, bool is_fec, uint8_t *buf, size_t buf_size)
 {
+	ChiakiNax5Counters *ctr = &audio_receiver->session->nax5_counters;
 	while(true)
 	{
 		ChiakiAudioSinkFrame frame_cb = NULL;
@@ -179,10 +182,21 @@ static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, Chi
 		if(buf)
 		{
 			if(audio_receiver->next_frame_index_valid && chiaki_seq_num_16_lt(frame_index, audio_receiver->next_frame_index))
+			{
+				// A FEC copy of an already delivered frame is the normal case, only source units are "late"
+				if(!is_fec)
+					CHIAKI_NAX5_INC(ctr, audio_late);
 				goto unlock_and_exit;
+			}
 
 			if(!chiaki_audio_receiver_store_audio_frame_locked(audio_receiver, frame_index, buf, buf_size))
-				goto unlock_and_exit;
+				goto unlock_and_exit; // duplicate (e.g. FEC copy of a frame we already have) or no slot
+			// The FEC copy filled a hole. Before playback started (prefill) there is no hole yet;
+			// frames older than next_frame_index were already rejected above.
+			if(is_fec && audio_receiver->playback_started)
+				CHIAKI_NAX5_INC(ctr, audio_fec_used);
+			CHIAKI_NAX5_MAX(ctr, audio_jitter_max, (uint32_t)audio_receiver->jitter_buffer_count);
+			CHIAKI_NAX5_SET(ctr, audio_jitter_last, (uint32_t)audio_receiver->jitter_buffer_count);
 			buf = NULL;
 			buf_size = 0;
 		}
@@ -236,12 +250,23 @@ static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, Chi
 				}
 				if(can_conceal_loss)
 				{
+					// NAX5: after a long gap conceal only the last CHIAKI_AUDIO_MAX_CONCEAL frames
+					uint32_t skipped = 0;
+					audio_receiver->next_frame_index = chiaki_audio_receiver_cap_conceal(audio_receiver->next_frame_index,
+							audio_receiver->jitter_buffer[oldest].frame_index, &skipped);
+					if(skipped)
+					{
+						CHIAKI_NAX5_ADD(ctr, audio_skipped, skipped);
+						CHIAKI_LOGI(audio_receiver->log, "Audio gap of %u frame(s), skipped %u, concealing %d",
+								skipped + CHIAKI_AUDIO_MAX_CONCEAL, skipped, CHIAKI_AUDIO_MAX_CONCEAL);
+					}
 					frame_cb = audio_receiver->session->audio_sink.frame_cb;
 					frame_cb_user = audio_receiver->session->audio_sink.user;
 					deliver_buf = NULL;
 					deliver_buf_size = 0;
 					audio_receiver->frame_index_prev = audio_receiver->next_frame_index;
 					audio_receiver->next_frame_index++;
+					CHIAKI_NAX5_INC(ctr, audio_plc);
 				}
 			}
 		}
@@ -259,6 +284,7 @@ unlock_and_exit:
 		if(!frame_cb)
 			return;
 
+		CHIAKI_NAX5_INC(ctr, audio_frames); // delivered (real or concealed) frames
 		frame_cb(deliver_buf, deliver_buf_size, frame_cb_user);
 		if(deliver_owned_buf)
 			free(deliver_buf);

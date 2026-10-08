@@ -3,6 +3,7 @@
 #ifdef CHIAKI_HAVE_DBUS
 #include <fcntl.h>
 #include <unistd.h>
+#include <QDBusError>
 #include <QDBusMessage>
 #include <QDBusConnection>
 #include <QDBusPendingReply>
@@ -56,6 +57,15 @@ void SystemdInhibit::inhibit()
 void SystemdInhibit::simulateUserActivity()
 {
 #ifdef CHIAKI_HAVE_DBUS
+    // Called on every controller movement, i.e. about once a second while playing.
+    // Screensaver timeouts are a minute or more, so one call per 10 s is plenty. Game
+    // Mode (gamescope) has no org.freedesktop.ScreenSaver at all: stop after the
+    // first ServiceUnknown instead of a failing D-Bus round trip every second.
+    if (screensaver_missing)
+        return;
+    if (last_activity.isValid() && last_activity.elapsed() < 10000)
+        return;
+    last_activity.start();
     QDBusMessage call = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.ScreenSaver"),
                                                        QStringLiteral("/ScreenSaver"),
                                                        QStringLiteral("org.freedesktop.ScreenSaver"),
@@ -66,8 +76,13 @@ void SystemdInhibit::simulateUserActivity()
     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher]() {
         watcher->deleteLater();
         const QDBusPendingReply<void> reply = *watcher;
-        if (reply.isError())
+        if (reply.isError()) {
             qWarning() << "Simulate User Activity Error:" << reply.error().name() << reply.error().message();
+            if (reply.error().type() == QDBusError::ServiceUnknown) {
+                screensaver_missing = true;
+                qInfo() << "No screensaver service, user activity will not be simulated";
+            }
+        }
     });
 #endif
 }

@@ -21,7 +21,16 @@ int main(int argc, char *argv[]) { return real_main(argc, argv); }
 #include <qmlmainwindow.h>
 #include "nax5/nax5processlog.h"
 #include "nax5/nax5runtime.h"
+#include "nax5/nax5singleinstance.h"
 #include <QApplication>
+#include <QTimer>
+#ifdef Q_OS_LINUX
+#include <QSocketNotifier>
+#include <csignal>
+#include <cerrno>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include <QtTypes>
 
 #ifdef CHIAKI_ENABLE_CLI
@@ -100,6 +109,9 @@ int real_main(int argc, char *argv[])
 #if defined(Q_OS_WIN) || defined(Q_OS_LINUX)
 	qputenv("ANV_VIDEO_DECODE", "1");
 	qputenv("RADV_PERFTEST", "video_decode");
+	// Newer Mesa reads the Vulkan video decode switch from RADV_EXPERIMENTAL and drops it from RADV_PERFTEST.
+	if (!qEnvironmentVariableIsSet("RADV_EXPERIMENTAL"))
+		qputenv("RADV_EXPERIMENTAL", "video_decode");
 #endif
 #ifdef CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
 	if (qEnvironmentVariableIsSet("SteamDeck"))
@@ -178,6 +190,13 @@ int real_main(int argc, char *argv[])
 
 	parser.process(app);
 	QStringList args = parser.positionalArguments();
+
+	// Product players get one client; a second launch brings the first one forward.
+	// Only the plain no-args GUI path (the RunMain branch below) is guarded, and the
+	// check runs before Settings (migrations/writes), windows, logs, controllers, etc.,
+	// so a second instance exits without side effects.
+	if(args.isEmpty() && !Nax5Runtime::operatorMode() && !nax5AcquireSingleInstance(nax5SingleInstanceName()))
+		return 0;
 
 	Settings settings(parser.isSet(profile_option) ? parser.value(profile_option) : QString());
 	bool exit_app_on_stream_exit = parser.isSet(stream_exit_option);
@@ -317,10 +336,48 @@ int real_main(int argc, char *argv[])
 	}
 }
 
+#ifdef Q_OS_LINUX
+static int term_signal_fd[2] = { -1, -1 };
+
+static void TermSignalHandler(int)
+{
+	const int saved_errno = errno;
+	const char c = 1;
+	ssize_t r = ::write(term_signal_fd[0], &c, 1);
+	(void)r;
+	errno = saved_errno;
+}
+
+// SIGTERM (Steam closing the game) stops the stream without the "disconnect?" dialog and
+// closes the window, so the console gets a proper disconnect (see requestTerminate()).
+static void InstallTermHandler(QmlMainWindow *window)
+{
+	if(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, term_signal_fd) != 0)
+		return;
+	auto *notifier = new QSocketNotifier(term_signal_fd[1], QSocketNotifier::Read, window);
+	QObject::connect(notifier, &QSocketNotifier::activated, window, [window]() {
+		char buf[16];
+		while(::read(term_signal_fd[1], buf, sizeof(buf)) > 0) {}
+		nax5ReleaseSingleInstance();
+		window->requestTerminate();
+	});
+	struct sigaction sa = {};
+	sa.sa_handler = TermSignalHandler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	sigaction(SIGTERM, &sa, nullptr);
+}
+#else
+static void InstallTermHandler(QmlMainWindow *) {}
+#endif
+
 int RunMain(QGuiApplication &app, Settings *settings, bool exit_app_on_stream_exit)
 {
 	QmlMainWindow main_window(settings, exit_app_on_stream_exit);
 	main_window.show();
+	InstallTermHandler(&main_window);
+	// Closing from the UI: free the single-instance name as soon as the window goes.
+	QObject::connect(&app, &QGuiApplication::lastWindowClosed, &app, []() { nax5ReleaseSingleInstance(); });
 	return app.exec();
 }
 
@@ -328,5 +385,6 @@ int RunStream(QGuiApplication &app, const StreamSessionConnectInfo &connect_info
 {
 	QmlMainWindow main_window(connect_info);
 	main_window.show();
+	InstallTermHandler(&main_window);
 	return app.exec();
 }

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
 
 #include <munit.h>
+#include <unistd.h>
+#include <string.h>
 
 #include <chiaki/takion.h>
 #include <chiaki/seqnum.h>
@@ -8,6 +10,7 @@
 
 #define CHIAKI_UNIT_TEST
 #include "../lib/src/takionsendbuffer.c"
+#include "../lib/src/takion_nax5.h"
 
 #include "test_log.h"
 
@@ -160,6 +163,43 @@ static MunitResult test_takion_send_buffer(const MunitParameter params[], void *
 #undef nums_count
 }
 
+// NAX5: live RTT is sampled only for the packet an ACK names exactly and only if never retransmitted.
+static MunitResult test_takion_send_buffer_rtt(const MunitParameter params[], void *user)
+{
+	ChiakiTakionSendBuffer send_buffer;
+	ChiakiErrorCode err = chiaki_takion_send_buffer_init(&send_buffer, NULL, 8);
+	munit_assert_int(err, ==, CHIAKI_ERR_SUCCESS);
+	send_buffer.log = get_test_log();
+	ChiakiNax5Counters ctr;
+	memset(&ctr, 0, sizeof(ctr));
+	send_buffer.nax5_counters = &ctr;
+
+	munit_assert_int(chiaki_takion_send_buffer_push(&send_buffer, 10, malloc(8), 8), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_int(chiaki_takion_send_buffer_push(&send_buffer, 11, malloc(8), 8), ==, CHIAKI_ERR_SUCCESS);
+	munit_assert_int(chiaki_takion_send_buffer_push(&send_buffer, 12, malloc(8), 8), ==, CHIAKI_ERR_SUCCESS);
+	send_buffer.packets[1].tries = 1; // seq 11 was retransmitted
+	usleep(3000);
+
+	// Cumulative ACK of 11: 10 is only covered (not named), 11 is ambiguous (retransmitted) -> no sample
+	chiaki_takion_send_buffer_ack(&send_buffer, 11, NULL, NULL);
+	munit_assert_uint32(ctr.data_rtt_samples, ==, 0);
+
+	chiaki_takion_send_buffer_ack(&send_buffer, 12, NULL, NULL);
+	munit_assert_uint32(ctr.data_rtt_samples, ==, 1);
+	munit_assert_uint32(ctr.data_rtt_us_last, >=, 3000);
+	munit_assert_uint32(ctr.data_rtt_us_smoothed, ==, ctr.data_rtt_us_last);
+	uint32_t first = ctr.data_rtt_us_last;
+
+	munit_assert_int(chiaki_takion_send_buffer_push(&send_buffer, 13, malloc(8), 8), ==, CHIAKI_ERR_SUCCESS);
+	chiaki_takion_send_buffer_ack(&send_buffer, 13, NULL, NULL);
+	munit_assert_uint32(ctr.data_rtt_samples, ==, 2);
+	uint32_t second = ctr.data_rtt_us_last;
+	munit_assert_uint32(ctr.data_rtt_us_smoothed, ==, (uint32_t)((7ull * first + second) / 8));
+
+	chiaki_takion_send_buffer_fini(&send_buffer);
+	return MUNIT_OK;
+}
+
 static MunitResult test_takion_format_congestion(const MunitParameter params[], void *user)
 {
 	static const uint8_t handshake_key[] = { 0x54, 0x65, 0x4c, 0x34, 0x5c, 0xac, 0x56, 0xb8, 0xea, 0xe6, 0x15, 0x2a, 0xde, 0x1c, 0xe2, 0xe8 };
@@ -195,6 +235,176 @@ static MunitResult test_takion_format_congestion(const MunitParameter params[], 
 	return MUNIT_OK;
 }
 
+static MunitResult test_takion_parse_data_ack(const MunitParameter params[], void *user)
+{
+	Nax5TakionDataAck ack;
+
+	// Plain ack: cumulative 0x11223344, a_rwnd 0x10000, no gaps.
+	static const uint8_t plain[] = { 0x11, 0x22, 0x33, 0x44, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	munit_assert_true(nax5_takion_parse_data_ack(plain, sizeof(plain), &ack));
+	munit_assert_uint32(ack.cumulative_seq_num, ==, 0x11223344);
+	munit_assert_uint32(ack.a_rwnd, ==, 0x10000);
+	munit_assert_uint16(ack.gap_ack_blocks_count, ==, 0);
+
+	// Ack with one gap block (size 0x10): what the console sends under packet loss,
+	// rejected upstream. The cumulative part must still be readable.
+	static const uint8_t one_gap[] = { 0x8b, 0xba, 0xfd, 0x58, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x02, 0x00, 0x03 };
+	munit_assert_true(nax5_takion_parse_data_ack(one_gap, sizeof(one_gap), &ack));
+	munit_assert_uint32(ack.cumulative_seq_num, ==, 0x8bbafd58);
+	munit_assert_uint16(ack.gap_ack_blocks_count, ==, 1);
+
+	// One gap block and one duplicate TSN (size 0x14).
+	static const uint8_t gap_dup[] = { 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x10, 0x00, 0x00, 0x01, 0x00, 0x01,
+		0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04 };
+	munit_assert_true(nax5_takion_parse_data_ack(gap_dup, sizeof(gap_dup), &ack));
+	munit_assert_uint16(ack.dup_tsns_count, ==, 1);
+
+	// Malformed: shorter than the header, or counts that don't match the size.
+	munit_assert_false(nax5_takion_parse_data_ack(plain, 10, &ack));
+	munit_assert_false(nax5_takion_parse_data_ack(plain, 0, &ack));
+	static const uint8_t gap_missing[] = { 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x10, 0x00, 0x00, 0x02, 0x00, 0x00,
+		0x00, 0x02, 0x00, 0x03 };
+	munit_assert_false(nax5_takion_parse_data_ack(gap_missing, sizeof(gap_missing), &ack));
+	munit_assert_false(nax5_takion_parse_data_ack(one_gap, 14, &ack));
+
+	return MUNIT_OK;
+}
+
+static MunitResult test_takion_data_is_stale(const MunitParameter params[], void *user)
+{
+	// Older than the next expected chunk: a retransmission of delivered data.
+	munit_assert_true(nax5_takion_data_is_stale(5, 6));
+	munit_assert_true(nax5_takion_data_is_stale(0x3bcbcd69, 0x3bcbcd72));
+	// The next expected chunk and anything after it are new.
+	munit_assert_false(nax5_takion_data_is_stale(6, 6));
+	munit_assert_false(nax5_takion_data_is_stale(7, 6));
+	// Across the 32-bit wrap.
+	munit_assert_true(nax5_takion_data_is_stale(0xffffffff, 0x1));
+	munit_assert_false(nax5_takion_data_is_stale(0x1, 0xffffffff));
+	return MUNIT_OK;
+}
+
+static MunitResult test_takion_reack_allow(const MunitParameter params[], void *user)
+{
+	uint64_t last_us = 0;
+	uint32_t last_seq = 0;
+	// First re-ack always goes out.
+	munit_assert_true(nax5_takion_reack_allow(&last_us, &last_seq, 0x100, 1000000));
+	munit_assert_uint64(last_us, ==, 1000000);
+	munit_assert_uint32(last_seq, ==, 0x100);
+	// Same seq within 5 ms: a retransmission burst, suppressed. State untouched.
+	munit_assert_false(nax5_takion_reack_allow(&last_us, &last_seq, 0x100, 1000000 + 4999));
+	munit_assert_uint64(last_us, ==, 1000000);
+	// Same seq at exactly 5 ms: allowed again.
+	munit_assert_true(nax5_takion_reack_allow(&last_us, &last_seq, 0x100, 1000000 + 5000));
+	munit_assert_uint64(last_us, ==, 1005000);
+	// A different seq is never suppressed, even right away.
+	munit_assert_true(nax5_takion_reack_allow(&last_us, &last_seq, 0x101, 1005001));
+	munit_assert_uint32(last_seq, ==, 0x101);
+	// ...and going back to the old seq immediately is a new seq relative to the last one.
+	munit_assert_true(nax5_takion_reack_allow(&last_us, &last_seq, 0x100, 1005002));
+	munit_assert_false(nax5_takion_reack_allow(&last_us, &last_seq, 0x100, 1005003));
+
+	// A monotonic clock that happens to start at 0 must still be treated as "no re-ack yet".
+	last_us = 0;
+	last_seq = 7;
+	munit_assert_true(nax5_takion_reack_allow(&last_us, &last_seq, 7, 10));
+	return MUNIT_OK;
+}
+
+static MunitResult test_takion_ratelimit(const MunitParameter params[], void *user)
+{
+	uint64_t last_us = 0;
+	munit_assert_true(nax5_takion_ratelimit(&last_us, 5, 1000000));
+	munit_assert_uint64(last_us, ==, 5);
+	munit_assert_false(nax5_takion_ratelimit(&last_us, 999999, 1000000));
+	munit_assert_false(nax5_takion_ratelimit(&last_us, 1000004, 1000000));
+	munit_assert_true(nax5_takion_ratelimit(&last_us, 1000005, 1000000));
+	munit_assert_uint64(last_us, ==, 1000005);
+	munit_assert_false(nax5_takion_ratelimit(&last_us, 1000006, 1000000));
+	return MUNIT_OK;
+}
+
+static unsigned int reorder_skip_drops;
+static void reorder_skip_drop_cb(uint64_t seq_num, void *elem_user, void *cb_user)
+{
+	(void)seq_num;
+	(void)elem_user;
+	(void)cb_user;
+	reorder_skip_drops++;
+}
+
+static MunitResult test_takion_reorder_skip_missing(const MunitParameter params[], void *user)
+{
+	ChiakiReorderQueue queue;
+	munit_assert_int(chiaki_reorder_queue_init_16(&queue, 3, 40), ==, CHIAKI_ERR_SUCCESS); // 8 slots, expecting 40
+	chiaki_reorder_queue_set_drop_strategy(&queue, CHIAKI_REORDER_QUEUE_DROP_STRATEGY_BEGIN);
+	reorder_skip_drops = 0;
+	chiaki_reorder_queue_set_drop_cb(&queue, reorder_skip_drop_cb, NULL);
+
+	uint64_t seq_num = 0;
+	void *elem = NULL;
+	uint64_t skipped = 0;
+
+	// 40 and 41 missing, 42 and 45 buffered: span is 40..45 (count 6)
+	chiaki_reorder_queue_push(&queue, 42, (void *)42);
+	chiaki_reorder_queue_push(&queue, 45, (void *)45);
+	munit_assert_uint64(chiaki_reorder_queue_count(&queue), ==, 6);
+	munit_assert_false(chiaki_reorder_queue_pull(&queue, &seq_num, &elem));
+
+	munit_assert_true(nax5_takion_reorder_skip_missing(&queue, &skipped));
+	munit_assert_uint64(skipped, ==, 2);
+	munit_assert_uint64(queue.begin, ==, 42);
+	munit_assert_uint64(chiaki_reorder_queue_count(&queue), ==, 4);
+	munit_assert_true(chiaki_reorder_queue_pull(&queue, &seq_num, &elem));
+	munit_assert_uint64(seq_num, ==, 42);
+	munit_assert_false(chiaki_reorder_queue_pull(&queue, &seq_num, &elem)); // 43 missing
+
+	// 43, 44 missing before 45
+	munit_assert_true(nax5_takion_reorder_skip_missing(&queue, &skipped));
+	munit_assert_uint64(skipped, ==, 2);
+	munit_assert_uint64(queue.begin, ==, 45);
+	munit_assert_uint64(chiaki_reorder_queue_count(&queue), ==, 1);
+	munit_assert_true(chiaki_reorder_queue_pull(&queue, &seq_num, &elem));
+	munit_assert_uint64(seq_num, ==, 45);
+	munit_assert_uint64(chiaki_reorder_queue_count(&queue), ==, 0);
+
+	// Head present: nothing to skip, queue untouched.
+	chiaki_reorder_queue_push(&queue, 46, (void *)46);
+	munit_assert_true(nax5_takion_reorder_skip_missing(&queue, &skipped));
+	munit_assert_uint64(skipped, ==, 0);
+	munit_assert_uint64(queue.begin, ==, 46);
+	munit_assert_uint64(chiaki_reorder_queue_count(&queue), ==, 1);
+	munit_assert_true(chiaki_reorder_queue_pull(&queue, &seq_num, &elem));
+
+	// Invariant under an inconsistent span (count > 0 but no slot set, seq 47..49): the
+	// helper must empty the span instead of leaving count > 0, and the queue must keep
+	// working afterwards: 47 is still accepted in order, 46 is dropped as too old.
+	queue.count = 3;
+	for(uint64_t i=0; i<3; i++)
+		queue.queue[(queue.begin + i) & 7].set = false;
+	munit_assert_false(nax5_takion_reorder_skip_missing(&queue, &skipped));
+	munit_assert_uint64(skipped, ==, 3);
+	munit_assert_uint64(chiaki_reorder_queue_count(&queue), ==, 0);
+	munit_assert_uint64(queue.begin, ==, 47);
+	munit_assert_false(chiaki_reorder_queue_pull(&queue, &seq_num, &elem));
+	chiaki_reorder_queue_push(&queue, 48, (void *)48);
+	munit_assert_uint64(chiaki_reorder_queue_count(&queue), ==, 2);
+	chiaki_reorder_queue_push(&queue, 47, (void *)47);
+	munit_assert_uint(reorder_skip_drops, ==, 0);
+	chiaki_reorder_queue_push(&queue, 46, (void *)46);
+	munit_assert_uint(reorder_skip_drops, ==, 1);
+	munit_assert_true(chiaki_reorder_queue_pull(&queue, &seq_num, &elem));
+	munit_assert_uint64(seq_num, ==, 47);
+	munit_assert_true(chiaki_reorder_queue_pull(&queue, &seq_num, &elem));
+	munit_assert_uint64(seq_num, ==, 48);
+	munit_assert_uint64(chiaki_reorder_queue_count(&queue), ==, 0);
+
+	chiaki_reorder_queue_fini(&queue);
+	return MUNIT_OK;
+}
+
 MunitTest tests_takion[] = {
 	{
 		"/av_packet_parse",
@@ -221,8 +431,56 @@ MunitTest tests_takion[] = {
 		NULL
 	},
 	{
+		"/send_buffer_rtt",
+		test_takion_send_buffer_rtt,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
+	{
 		"/format_congestion",
 		test_takion_format_congestion,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
+	{
+		"/parse_data_ack",
+		test_takion_parse_data_ack,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
+	{
+		"/data_is_stale",
+		test_takion_data_is_stale,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
+	{
+		"/reack_allow",
+		test_takion_reack_allow,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
+	{
+		"/ratelimit",
+		test_takion_ratelimit,
+		NULL,
+		NULL,
+		MUNIT_TEST_OPTION_NONE,
+		NULL
+	},
+	{
+		"/reorder_skip_missing",
+		test_takion_reorder_skip_missing,
 		NULL,
 		NULL,
 		MUNIT_TEST_OPTION_NONE,

@@ -12,6 +12,8 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QProcess>
+#include <QFile>
+#include <libplacebo/colorspace.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -57,6 +59,15 @@ static bool hwDecoderRuntimeAvailable(const QString &name)
     return true;
 }
 
+// The LCD Steam Deck reports "Jupiter", the OLED one "Galileo". Anything else gets the OLED profile.
+static QString nax5DetectDeviceProfile()
+{
+    QFile file(QStringLiteral("/sys/class/dmi/id/product_name"));
+    if (file.open(QIODevice::ReadOnly) && file.readAll().trimmed() == "Jupiter")
+        return QStringLiteral("lcd");
+    return QStringLiteral("oled");
+}
+
 QmlSettings::QmlSettings(Settings *settings, QObject *parent)
     : QObject(parent)
     , settings(settings)
@@ -66,6 +77,11 @@ QmlSettings::QmlSettings(Settings *settings, QObject *parent)
 
     connect(settings, &Settings::RegisteredHostsUpdated, this, &QmlSettings::registeredHostsChanged);
     connect(settings, &Settings::ProfilesUpdated, this, &QmlSettings::profilesChanged);
+
+    // First start of the Steam Deck build: pick the profile for this device once. Later the player's
+    // choice (and any manual change of the individual settings) is kept.
+    if (settings->GetNax5DeviceProfile().isEmpty())
+        setDeviceProfile(nax5DetectDeviceProfile());
 }
 
 bool QmlSettings::remotePlayAsk() const
@@ -110,6 +126,28 @@ void QmlSettings::setShowStreamStats(bool enabled)
 {
     settings->SetShowStreamStats(enabled);
     emit showStreamStatsChanged();
+}
+
+int QmlSettings::streamStatsLayout() const
+{
+    return settings->GetStreamStatsLayout();
+}
+
+void QmlSettings::setStreamStatsLayout(int layout)
+{
+    settings->SetStreamStatsLayout(layout);
+    emit streamStatsLayoutChanged();
+}
+
+int QmlSettings::streamStatsScale() const
+{
+    return settings->GetStreamStatsScale();
+}
+
+void QmlSettings::setStreamStatsScale(int scale)
+{
+    settings->SetStreamStatsScale(scale);
+    emit streamStatsScaleChanged();
 }
 
 bool QmlSettings::streamerMode() const
@@ -482,6 +520,41 @@ void QmlSettings::setCodecRemotePS5(int codec)
 {
     settings->SetCodecRemotePS5(static_cast<ChiakiCodec>(codec));
     emit codecRemotePS5Changed();
+}
+
+QString QmlSettings::deviceProfile() const
+{
+    return settings->GetNax5DeviceProfile();
+}
+
+void QmlSettings::setDeviceProfile(const QString &profile)
+{
+    const bool lcd = profile == QLatin1String("lcd");
+    settings->SetNax5DeviceProfile(lcd ? QStringLiteral("lcd") : QStringLiteral("oled"));
+    // Both: 1080p 60 fps decoded by the GPU (Vulkan video). The bitrate stays the player's.
+    setResolutionRemotePS5(CHIAKI_VIDEO_RESOLUTION_PRESET_1080p);
+    setFpsRemotePS5(60);
+    setDecoder(QStringLiteral("vulkan"));
+    if (lcd)
+    {
+        // SDR panel: an SDR stream, colours as the display reports them.
+        setCodecRemotePS5(CHIAKI_CODEC_H265);
+        setDisplayTargetPrim(0);
+        setDisplayTargetTrc(0);
+        setDisplayTargetPeak(0);
+        setDisplayTargetContrast(0);
+    }
+    else
+    {
+        // HDR OLED panel: an HDR10 stream shown as BT.2020 / PQ, true black (infinite contrast),
+        // peak brightness as the display reports it.
+        setCodecRemotePS5(CHIAKI_CODEC_H265_HDR);
+        setDisplayTargetPrim(PL_COLOR_PRIM_BT_2020);
+        setDisplayTargetTrc(PL_COLOR_TRC_PQ);
+        setDisplayTargetPeak(0);
+        setDisplayTargetContrast(-1);
+    }
+    emit deviceProfileChanged();
 }
 
 int QmlSettings::displayTargetContrast() const
@@ -1841,6 +1914,8 @@ void QmlSettings::refreshAllKeys()
     emit allowJoystickBackgroundEventsChanged();
     emit startMicUnmutedChanged();
     emit showStreamStatsChanged();
+    emit streamStatsLayoutChanged();
+    emit streamStatsScaleChanged();
     emit streamerModeChanged();
 #ifdef CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
     emit verticalDeckChanged();

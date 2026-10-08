@@ -299,11 +299,18 @@ void Settings::ImportPlaceboSettings(QString filepath)
 	}
 }
 
+// NAX5: engine log level. Default INFO and above; NAX5_LOG_LEVEL=debug adds DEBUG,
+// NAX5_LOG_LEVEL=verbose (or the GUI verbose setting) enables everything.
 uint32_t Settings::GetLogLevelMask()
 {
 	uint32_t mask = CHIAKI_LOG_ALL;
-	if(!GetLogVerbose())
-		mask &= ~CHIAKI_LOG_VERBOSE;
+	const QByteArray env = qgetenv("NAX5_LOG_LEVEL").trimmed().toLower();
+	if(GetLogVerbose() || env == "verbose")
+		return mask;
+	mask &= ~CHIAKI_LOG_VERBOSE;
+	if(env == "debug")
+		return mask;
+	mask &= ~CHIAKI_LOG_DEBUG;
 	return mask;
 }
 
@@ -678,8 +685,8 @@ static const QMap<WindowType, QString> window_type_values = {
 
 WindowType Settings::GetWindowType() const
 {
-	auto v = settings.value("settings/window_type", window_type_values[WindowType::Fullscreen]).toString();
-	return window_type_values.key(v, WindowType::Fullscreen);
+	auto v = settings.value("settings/window_type", window_type_values[WindowType::Stretch]).toString();
+	return window_type_values.key(v, WindowType::Stretch);
 }
 
 void Settings::SetWindowType(WindowType type)
@@ -1117,6 +1124,16 @@ int Settings::GetDisplayTargetTrc() const
 void Settings::SetDisplayTargetTrc(int trc)
 {
 	settings.setValue("settings/display_target_trc", trc);
+}
+
+QString Settings::GetNax5DeviceProfile() const
+{
+	return settings.value("settings/nax5_device_profile").toString();
+}
+
+void Settings::SetNax5DeviceProfile(const QString &profile)
+{
+	settings.setValue("settings/nax5_device_profile", profile);
 }
 
 int Settings::GetDisplayTargetPrim() const

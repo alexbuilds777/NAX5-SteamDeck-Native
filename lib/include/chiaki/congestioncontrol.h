@@ -19,6 +19,9 @@ typedef struct chiaki_congestion_control_t
 	ChiakiBoolPredCond stop_cond;
 	double packet_loss;
 	double packet_loss_max;
+	// NAX5: rate limiting of the "Clamping reported packet loss" line (thread-local to the control thread)
+	uint64_t clamp_log_last_us;
+	uint32_t clamp_since_log;
 } ChiakiCongestionControl;
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_congestion_control_start(ChiakiCongestionControl *control, ChiakiTakion *takion, ChiakiPacketStats *stats, double packet_loss_max);

@@ -26,6 +26,9 @@ bool nax5PlayEligibilityOk(bool authenticated, bool email_verified, const QStrin
 bool nax5AcceptAsync(quint64 live_generation, quint64 event_generation, quint64 live_request_id, quint64 event_request_id);
 bool nax5AcceptSessionIdentity(const QString &live_session_id, const QString &event_session_id);
 int nax5TerminalRetryLimit();
+// Pause before chiaki re-requests a Remote Play session that failed to start
+// (e.g. the console is still releasing the previous one: "Remote is already in use").
+int nax5StreamRetryDelayMs(qint64 elapsed_since_first_attempt_ms);
 int nax5ShutdownGraceMs();
 int nax5ShutdownReportGraceMs();
 bool nax5MaySleepConsole(bool operator_mode);
@@ -55,3 +58,19 @@ struct Nax5MaterialWakeup
 };
 
 Nax5MaterialWakeup nax5MaterialWakeupCall(const QString &host, const QByteArray &regist_key, bool ps5);
+
+// Play time for people: whole minutes, never rounded up ("1 ч 12 мин").
+QString nax5FormatPlayTime(qint64 seconds);
+// 600, 300 or 60 when the time left has just dropped to ten, five or one minute; 0 otherwise.
+int nax5LowTimeThreshold(qint64 previous_remaining, qint64 remaining);
+QString nax5LowTimeNotice(int threshold);
+// How long the notice stays over the stream.
+int nax5LowTimeNoticeMs(int threshold);
+// One line about the single console for the play panel; empty when the server says nothing.
+QString nax5ConsoleStatusText(const QString &state, qint64 free_in_seconds, bool just_freed);
+// What to tell the player when the server ended the session; `reason` comes from the closing answer.
+QString nax5SessionClosedText(const QString &reason);
+bool nax5SessionClosedForBalance(const QString &reason);
+
+// How long «Играть» stays blocked after the server refused; the server's own pause when it tells one.
+int nax5ReserveRetryPauseMs(qint64 retry_after_seconds);

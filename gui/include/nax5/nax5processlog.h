@@ -45,10 +45,18 @@ QStringList nax5RecentChiakiSessionLogPaths(int max_files);
 QString nax5ChiakiSessionLogTail(int max_bytes);
 QString nax5SanitizeProcessLogLine(const QString &line);
 QString nax5ClientVersion();
+// Short git sha of the compiled tree (build-time nax5_build.h; "testsha" in unit tests)
 QString nax5ClientSha();
+// `git describe --always --dirty --tags` of the compiled tree, for CSV/log "build=" fields.
+// Static storage, never null.
+const char *nax5_build_id();
+// NAX5_SESSION_ID from the environment (set by the wrapper), or "local-<pid>" when unset.
+QString nax5SessionIdBase();
 QString nax5OsPlatform();
 QString nax5OsVersion();
 QString nax5OsBuild();
 QString nax5LocaleName();
+// Display adapters and driver versions for BUILD-INFO; empty off Windows.
+QString nax5GpuAdapters();
 QString nax5BuildInfoText();
 QString nax5BuildInfoText(const Nax5BuildInfoSnapshot &snapshot);

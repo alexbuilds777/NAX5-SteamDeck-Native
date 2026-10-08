@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
 
 #include <streamsession.h>
+#include "nax5/session/nax5sessionlifecycle.h"
 #include <settings.h>
 #include <controllermanager.h>
 
@@ -14,6 +15,8 @@
 #include <QKeyEvent>
 #include <QMutexLocker>
 #include <QtMath>
+#include <QFile>
+#include <QTimer>
 #include <atomic>
 
 #include <algorithm>
@@ -46,6 +49,70 @@
 #if CHIAKI_GUI_ENABLE_SPEEX
 #define ECHO_QUEUE_MAX 40
 #endif
+
+// NAX5 audio latency cap: once audio waiting for playback (ring buffer + SDL queue)
+// stays above the cap for AUDIO_CAP_SUSTAIN_MS, the oldest queued audio is dropped so
+// that audio lag caused by a network stall recovers instead of persisting forever.
+//   NAX5_AUDIO_MAX_MS=<ms>  cap in milliseconds (default 150)
+//   NAX5_AUDIO_MAX_MS=0     no cap, only the ring overflow trims (upstream behaviour)
+// Normal operation keeps ~100-110 ms queued (SDL top-up + ring), so leave headroom.
+#define AUDIO_CAP_DEFAULT_MS 150
+#define AUDIO_CAP_SUSTAIN_MS 500
+#define AUDIO_CAP_LOG_INTERVAL_MS 10000
+
+// NAX5 slow trim (see nax5audiotrim.h): drops audio that stayed queued for a whole
+// window, down to the headroom, in small steps. Handles the standing latency the hard
+// cap above misses because the queue saw-tooths across it.
+//   NAX5_AUDIO_HEADROOM_MS=<ms>  standing minimum to keep (default 70)
+//   NAX5_AUDIO_HEADROOM_MS=0     slow trim off (also off when NAX5_AUDIO_MAX_MS=0)
+// The minimum is sampled when a packet arrives, i.e. at the queue's peak, and the device
+// then pulls 10-50 ms at once: with 40 ms the queue ran dry a minute after some trims.
+#define AUDIO_TRIM_HEADROOM_DEFAULT_MS 70
+#define AUDIO_TRIM_WINDOW_MS 3000
+#define AUDIO_TRIM_HYSTERESIS_MS 20
+#define AUDIO_TRIM_STEP_MS 40
+// Crossfade over the cut of every trim/cap drop, so it is not heard as a click
+#define AUDIO_SPLICE_FADE_MS 10
+#define AUDIO_RING_MIN_MS 500
+// Requested device buffer (settings, bytes) is rounded down to whole sample frames
+// and clamped to this range before it is handed to SDL.
+#define AUDIO_BUFFER_MIN_BYTES 960
+#define AUDIO_BUFFER_MAX_BYTES 48000
+
+static unsigned int nax5_audio_max_ms()
+{
+	static const unsigned int value = []() -> unsigned int {
+		const QByteArray v = qgetenv("NAX5_AUDIO_MAX_MS").trimmed();
+		if(v.isEmpty())
+			return AUDIO_CAP_DEFAULT_MS;
+		bool ok = false;
+		const unsigned int ms = v.toUInt(&ok);
+		if(!ok || ms > 5000)
+			return AUDIO_CAP_DEFAULT_MS;
+		return ms;
+	}();
+	return value;
+}
+
+static unsigned int nax5_audio_headroom_ms()
+{
+	static const unsigned int value = []() -> unsigned int {
+		const QByteArray v = qgetenv("NAX5_AUDIO_HEADROOM_MS").trimmed();
+		if(v.isEmpty())
+			return AUDIO_TRIM_HEADROOM_DEFAULT_MS;
+		bool ok = false;
+		const unsigned int ms = v.toUInt(&ok);
+		if(!ok || ms > 1000)
+			return AUDIO_TRIM_HEADROOM_DEFAULT_MS;
+		return ms;
+	}();
+	return value;
+}
+
+static uint64_t nax5_audio_bytes_for_ms(uint64_t ms, unsigned int rate, size_t frame_size)
+{
+	return (uint64_t)rate * frame_size * ms / 1000;
+}
 
 static bool isLocalAddress(QString host)
 {
@@ -304,6 +371,14 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 		chiaki_connect_info.video_profile.codec = CHIAKI_CODEC_H264;
 	}
 #endif
+	{
+		const ChiakiCodec codec = chiaki_target_is_ps5(connect_info.target) ? chiaki_connect_info.video_profile.codec : CHIAKI_CODEC_H264;
+		const char *codec_name = codec == CHIAKI_CODEC_H265_HDR ? "HEVC HDR" : codec == CHIAKI_CODEC_H265 ? "HEVC" : "H264";
+		const QString decoder_name = connect_info.hw_decoder.isEmpty() ? QStringLiteral("software") : connect_info.hw_decoder;
+		stream_info = QStringLiteral("%1 · %2 · запрошено %3 Мбит/с")
+			.arg(QLatin1String(codec_name), decoder_name)
+			.arg(chiaki_connect_info.video_profile.bitrate / 1000.0, 0, 'f', 0);
+	}
 	if(connect_info.duid.isEmpty())
 	{
 		if(connect_info.regist_key.size() != sizeof(chiaki_connect_info.regist_key))
@@ -502,15 +577,76 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
 		}
 	});
 
+	// NAX5: overlay status tick: live ping every 1 s, battery every 10 s
+	QTimer *overlay_status_timer = new QTimer(this);
+	overlay_status_timer->setInterval(1000);
+	connect(overlay_status_timer, &QTimer::timeout, this, &StreamSession::UpdateOverlayStatus);
+	overlay_status_timer->start();
+	UpdateOverlayStatus();
+
 	StartAudioOutDrainThread();
+}
+
+void StreamSession::UpdateOverlayStatus()
+{
+	ChiakiNax5Counters snap;
+	chiaki_session_get_nax5_counters(&session, &snap);
+	const int ping = snap.data_rtt_samples > 0 ? static_cast<int>((snap.data_rtt_us_smoothed + 500) / 1000) : 0;
+	if(ping != live_ping_ms)
+	{
+		live_ping_ms = ping;
+		emit PingChanged();
+	}
+
+	// Buffered session log: write out lines that have been sitting in memory for >= 1 s so a
+	// quiet session (no new line to trigger the flush) still reaches the file / live tail.
+	log.FlushIfStale();
+
+	// Battery changes slowly: read sysfs every 10th tick (10 s); the ping above is free (heartbeat ACKs).
+	if(overlay_status_ticks++ % 10 != 0)
+		return;
+	int pct = -1;
+	bool charging = false;
+	QFile cap(QStringLiteral("/sys/class/power_supply/BAT1/capacity"));
+	if(cap.open(QIODevice::ReadOnly))
+	{
+		bool ok = false;
+		const int v = QString::fromLatin1(cap.readAll()).trimmed().toInt(&ok);
+		if(ok)
+			pct = qBound(0, v, 100);
+	}
+	QFile status(QStringLiteral("/sys/class/power_supply/BAT1/status"));
+	if(status.open(QIODevice::ReadOnly))
+	{
+		const QByteArray st = status.readAll().trimmed();
+		charging = st == "Charging" || st == "Full";
+	}
+	if(pct != battery_percent || charging != battery_charging)
+	{
+		battery_percent = pct;
+		battery_charging = charging;
+		emit BatteryChanged();
+	}
 }
 
 StreamSession::~StreamSession()
 {
 	mic_active.storeRelaxed(false);
 	StopAudioOutDrainThread();
+	// Best effort only: audio_out is cleared under audio_out_ring_mutex before the device
+	// is closed, so the ring-locked paths (cap/trim, runaway re-check, GetAudioQueuedMs)
+	// stop using it. PushAudioFrame / ReadMic on the Takion thread read audio_out /
+	// audio_in without a lock and can still pass the old id until the session threads are
+	// joined further below; SDL rejects a closed device id (queue calls fail or return 0).
 	if(audio_out)
-		SDL_CloseAudioDevice(audio_out);
+	{
+		SDL_AudioDeviceID dev = audio_out;
+		{
+			QMutexLocker locker(&audio_out_ring_mutex);
+			audio_out = 0;
+		}
+		SDL_CloseAudioDevice(dev);
+	}
 	{
 		QMutexLocker locker(&audio_out_ring_mutex);
 		audio_out_ring_buf.clear();
@@ -520,7 +656,11 @@ StreamSession::~StreamSession()
 		audio_out_overflow_logged = false;
 	}
 	if(audio_in)
-		SDL_CloseAudioDevice(audio_in);
+	{
+		SDL_AudioDeviceID dev = audio_in;
+		audio_in = 0;
+		SDL_CloseAudioDevice(dev);
+	}
 
 	// Prepare log for shutdown BEFORE joining session threads
 	// This prevents crashes from log callbacks during shutdown
@@ -1142,6 +1282,68 @@ void StreamSession::SendFeedbackState()
 	}
 	chiaki_controller_state_or(&state, &state, &dpad_touch_state);
 	chiaki_session_set_controller_state(&session, &state);
+	// Counts controller-state updates handed to the lib, not network packets (the lib
+	// sends feedback on its own schedule and may merge several updates into one packet).
+	feedback_sends.fetchAndAddRelaxed(1);
+
+#if CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+	// Input latency, upper bound of the client-side delay: this send minus the start of the
+	// poll tick preceding the one that delivered the event (the event may have happened at
+	// any time since then). Covers poll interval + GUI-thread stalls + processing, not the
+	// controller/kernel path before SDL sees the event.
+	const quint64 now_us = chiaki_time_now_monotonic_us();
+	for(auto controller : controllers)
+	{
+		quint64 since_us = 0;
+		if(!controller->TakeLastEventPollUs(&since_us))
+			continue;
+		if(since_us > now_us)
+			continue;
+		const quint64 latency_us64 = now_us - since_us;
+		if(latency_us64 > 60ull * 1000 * 1000) // stale value, not a real measurement
+			continue;
+		const quint32 latency_us = static_cast<quint32>(latency_us64);
+		quint32 cur = input_latency_max_us.loadRelaxed();
+		while(cur < latency_us && !input_latency_max_us.testAndSetRelaxed(cur, latency_us, cur)) {}
+	}
+#endif
+}
+
+ChiakiNax5Counters StreamSession::GetNax5Counters()
+{
+	ChiakiNax5Counters snap;
+	// Same as chiaki_session_get_nax5_counters(); that wrapper is declared in session.h
+	// but not yet defined in the lib, so snapshot the public member directly.
+	chiaki_nax5_counters_snapshot(&session.nax5_counters, &snap);
+	return snap;
+}
+
+Nax5AudioStats StreamSession::GetNax5AudioStats()
+{
+	Nax5AudioStats stats = {};
+	{
+		QMutexLocker locker(&audio_out_ring_mutex);
+		stats.trim_dropped_bytes = audio_out_trim_dropped_bytes;
+		stats.cap_dropped_bytes = audio_out_cap_dropped_bytes;
+		stats.queue_clears = audio_out_queue_clears;
+		stats.ring_overflows = audio_out_ring_overflows;
+		stats.starved_polls = audio_out_starved_polls;
+		stats.reopens = audio_out_reopens;
+	}
+	// Jitter-buffer depth from the counters snapshot (the lib stores it after each
+	// frame); never dereference stream_connection.audio_receiver here, the session
+	// thread frees it.
+	ChiakiNax5Counters snap;
+	chiaki_nax5_counters_snapshot(&session.nax5_counters, &snap);
+	stats.jitter_frames_last = (int)snap.audio_jitter_last;
+	return stats;
+}
+
+int StreamSession::GetHasBFrames()
+{
+	if(!ffmpeg_decoder)
+		return -1;
+	return __atomic_load_n(&ffmpeg_decoder->nax5_has_b_frames, __ATOMIC_RELAXED);
 }
 
 void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
@@ -1169,7 +1371,27 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 	spec.channels = channels;
 	spec.format = AUDIO_S16SYS;
 	audio_out_sample_size = sizeof(int16_t) * channels;
+	{
+		// Whole sample frames only, within a sane range (SDL takes a frame count, and the
+		// queue thresholds below are derived from this value).
+		const unsigned int frame = (unsigned int)audio_out_sample_size;
+		const unsigned int requested = audio_buffer_size;
+		unsigned int effective = qBound<unsigned int>(AUDIO_BUFFER_MIN_BYTES, requested, AUDIO_BUFFER_MAX_BYTES);
+		effective -= effective % frame;
+		if(effective < AUDIO_BUFFER_MIN_BYTES)
+			effective += frame; // rounding took it below the minimum: next whole frame up
+		if(effective != requested)
+			CHIAKI_LOGI(log.GetChiakiLog(), "Audio buffer size %u bytes adjusted to %u (multiple of %u, %u..%u)",
+				requested, effective, frame, (unsigned int)AUDIO_BUFFER_MIN_BYTES, (unsigned int)AUDIO_BUFFER_MAX_BYTES);
+		audio_buffer_size = effective;
+	}
 	spec.samples = audio_buffer_size / audio_out_sample_size;
+	{
+		QMutexLocker locker(&audio_out_ring_mutex);
+		if(audio_out_opened_once)
+			audio_out_reopens++;
+		audio_out_opened_once = true;
+	}
 
 	SDL_AudioSpec obtained;
 	audio_out = SDL_OpenAudioDevice(audio_out_device_name.isEmpty() ? nullptr : qUtf8Printable(audio_out_device_name), false, &spec, &obtained, false);
@@ -1196,18 +1418,39 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
 
 	{
 		QMutexLocker locker(&audio_out_ring_mutex);
-		audio_out_ring_buf.resize((int)(audio_buffer_size * 8));
+		// The ring absorbs bursts after network stalls. It used to be 8 device buffers
+		// (400 ms at the 50 ms default), which a smaller device buffer would shrink below
+		// a typical burst: keep at least AUDIO_RING_MIN_MS, in whole sample frames.
+		{
+			size_t ring_bytes = (size_t)audio_buffer_size * 8;
+			const size_t min_bytes = (size_t)nax5_audio_bytes_for_ms(AUDIO_RING_MIN_MS, rate, audio_out_sample_size);
+			if(ring_bytes < min_bytes)
+				ring_bytes = min_bytes;
+			ring_bytes -= ring_bytes % audio_out_sample_size;
+			audio_out_ring_buf.resize((int)ring_bytes);
+		}
 		audio_out_ring_read_pos = 0;
 		audio_out_ring_write_pos = 0;
 		audio_out_ring_fill = 0;
 		audio_out_overflow_logged = false;
+		// queued data is in the requested format (SDL converts to the obtained one)
+		audio_out_rate = rate;
+		audio_out_over_cap_since_ms = 0;
+		audio_out_cap_last_log_ms = 0;
+		audio_out_trim = Nax5AudioTrim();
+		audio_out_trim_last_log_ms = 0;
+		audio_out_queue_clear_last_log_ms = 0;
+		// dropped-bytes and event counters are cumulative for the session (stats CSV)
 	}
+	if(nax5_audio_max_ms())
+		CHIAKI_LOGI(log.GetChiakiLog(), "Audio latency cap %u ms (NAX5_AUDIO_MAX_MS), headroom %u ms (NAX5_AUDIO_HEADROOM_MS)",
+			nax5_audio_max_ms(), nax5_audio_headroom_ms());
 
 	SDL_PauseAudioDevice(audio_out, 0);
 	StartAudioOutDrainThread();
 
-	CHIAKI_LOGI(log.GetChiakiLog(), "Audio Device '%s' opened with %u channels @ %d Hz, buffer size %u",
-				qPrintable(audio_out_device_name), obtained.channels, obtained.freq, obtained.size);
+	CHIAKI_LOGI(log.GetChiakiLog(), "Audio Device '%s' opened with %u channels @ %d Hz, buffer size %u (effective audio_buffer_size %u bytes)",
+				qPrintable(audio_out_device_name), obtained.channels, obtained.freq, obtained.size, audio_buffer_size);
 }
 
 void StreamSession::InitMic(unsigned int channels, unsigned int rate)
@@ -1281,8 +1524,13 @@ void StreamSession::InitMic(unsigned int channels, unsigned int rate)
 			clear_mic_buffers();
 			return;
 		}
+		// Size both buffers from the frame layout, never from SDL_AudioCVT::len_ratio:
+		// on Windows sdl2-compat 2.32.64 packs SDL_AudioCVT inside the DLL but the
+		// public header does not, so len_ratio read here is garbage (often 0) and the
+		// echo buffer came out empty, corrupting the heap on every played frame.
+		// Mono mic frame -> stereo for the encoder.
 		mic_speex_cvt.len = mic_buf.size_bytes;
-		mic_resampler_buf = (uint8_t*) calloc(mic_speex_cvt.len * mic_speex_cvt.len_mult, sizeof(uint8_t));
+		mic_resampler_buf = (uint8_t*) calloc(mic_buf.size_bytes * 2 * qMax(1, mic_speex_cvt.len_mult), sizeof(uint8_t));
 		if(!mic_resampler_buf)
 		{
 			CHIAKI_LOGE(GetChiakiLog(), "Mic resampler buf could not be created, aborting mic startup");
@@ -1296,8 +1544,9 @@ void StreamSession::InitMic(unsigned int channels, unsigned int rate)
 			clear_mic_buffers();
 			return;
 		}
-		echo_speex_cvt.len = mic_speex_cvt.len * mic_speex_cvt.len_ratio;
-		echo_resampler_buf = (uint8_t*) calloc(echo_speex_cvt.len * echo_speex_cvt.len_mult, sizeof(uint8_t));
+		// Stereo playback frame (what PushAudioFrame copies in) -> mono echo reference.
+		echo_speex_cvt.len = mic_buf.size_bytes * 2;
+		echo_resampler_buf = (uint8_t*) calloc(echo_speex_cvt.len * qMax(1, echo_speex_cvt.len_mult), sizeof(uint8_t));
 		if(!echo_resampler_buf)
 		{
 			CHIAKI_LOGE(GetChiakiLog(), "Echo resampler buf could not be created, aborting mic startup");
@@ -1786,15 +2035,7 @@ void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
 	// qDebug() << "Audio queue" << (SDL_GetQueuedAudioSize(audio_out) / audio_out_sample_size / samples_count) * 10 << "ms";
 	// If the SDL queue runs away, drop the stale backlog and resume from the latest frame.
 	if(SDL_GetQueuedAudioSize(audio_out) > 3 * audio_buffer_size)
-	{
-		CHIAKI_LOGW(log.GetChiakiLog(), "Audio queue exceeded latency threshold, clearing queued audio");
-		SDL_ClearQueuedAudio(audio_out);
-		QMutexLocker locker(&audio_out_ring_mutex);
-		audio_out_ring_read_pos = 0;
-		audio_out_ring_write_pos = 0;
-		audio_out_ring_fill = 0;
-		audio_out_overflow_logged = false;
-	}
+		HandleAudioQueueRunaway();
 	if(audio_volume < SDL_MIX_MAXVOLUME)
 		SDL_MixAudioFormat((uint8_t *)buf.data(), (uint8_t *)og_buf, AUDIO_S16SYS, buf.size(), audio_volume);
 	else
@@ -1847,12 +2088,14 @@ void StreamSession::QueueAudioOutData(const QByteArray &audio_data)
 			audio_out_ring_read_pos = 0;
 			audio_out_ring_write_pos = 0;
 			audio_out_ring_fill = 0;
+			audio_out_ring_overflows++;
 		}
 		else if(data_size > capacity - audio_out_ring_fill)
 		{
 			size_t bytes_to_drop = data_size - (capacity - audio_out_ring_fill);
-			audio_out_ring_read_pos = (audio_out_ring_read_pos + bytes_to_drop) % capacity;
-			audio_out_ring_fill -= bytes_to_drop;
+			// crossfade over the cut like the trim and the cap do, a hard cut clicks
+			DropOldestAudioLocked(bytes_to_drop);
+			audio_out_ring_overflows++;
 			if(!audio_out_overflow_logged)
 			{
 				CHIAKI_LOGW(log.GetChiakiLog(), "Audio output ring overflow, dropping stale queued audio");
@@ -1866,6 +2109,7 @@ void StreamSession::QueueAudioOutData(const QByteArray &audio_data)
 			memcpy(audio_out_ring_buf.data(), data + first_copy, data_size - first_copy);
 		audio_out_ring_write_pos = (audio_out_ring_write_pos + data_size) % capacity;
 		audio_out_ring_fill += data_size;
+		EnforceAudioOutCapLocked();
 	}
 
 	{
@@ -1875,38 +2119,192 @@ void StreamSession::QueueAudioOutData(const QByteArray &audio_data)
 	audio_out_drain_wait.wakeOne();
 }
 
+void StreamSession::EnforceAudioOutCapLocked()
+{
+	const unsigned int max_ms = nax5_audio_max_ms();
+	if(!max_ms || !audio_out || !audio_out_rate || !audio_out_sample_size)
+		return;
+
+	const uint64_t cap_bytes = nax5_audio_bytes_for_ms(max_ms, audio_out_rate, audio_out_sample_size);
+	uint64_t queued = (uint64_t)SDL_GetQueuedAudioSize(audio_out) + audio_out_ring_fill;
+	const uint64_t now_ms = chiaki_time_now_monotonic_ms();
+	TrimStandingAudioLocked(now_ms, queued);
+	queued = (uint64_t)SDL_GetQueuedAudioSize(audio_out) + audio_out_ring_fill;
+	if(queued <= cap_bytes)
+	{
+		audio_out_over_cap_since_ms = 0;
+		return;
+	}
+
+	// Only trim when the backlog persists, short jitter bursts are left alone
+	if(!audio_out_over_cap_since_ms)
+	{
+		audio_out_over_cap_since_ms = now_ms;
+		return;
+	}
+	if(now_ms - audio_out_over_cap_since_ms < AUDIO_CAP_SUSTAIN_MS)
+		return;
+	audio_out_over_cap_since_ms = 0;
+
+	// Drop the oldest audio from the ring (the SDL queue is kept below the cap by
+	// DrainAudioOutRingBuffer), whole sample frames only to keep channel alignment.
+	uint64_t drop = qMin<uint64_t>(queued - cap_bytes, audio_out_ring_fill);
+	drop -= drop % audio_out_sample_size;
+	const size_t capacity = (size_t)audio_out_ring_buf.size();
+	if(!drop || !capacity)
+		return;
+	DropOldestAudioLocked((size_t)drop);
+	audio_out_cap_dropped_bytes += drop;
+
+	if(!audio_out_cap_last_log_ms || now_ms - audio_out_cap_last_log_ms >= AUDIO_CAP_LOG_INTERVAL_MS)
+	{
+		const uint64_t bytes_per_s = nax5_audio_bytes_for_ms(1000, audio_out_rate, audio_out_sample_size);
+		const uint64_t since_last = audio_out_cap_dropped_bytes - audio_out_cap_dropped_bytes_reported;
+		CHIAKI_LOGI(log.GetChiakiLog(), "Audio latency cap: dropped %llu ms of stale audio since last report (queued %llu ms > %u ms)",
+			(unsigned long long)(since_last * 1000 / bytes_per_s),
+			(unsigned long long)(queued * 1000 / bytes_per_s), max_ms);
+		audio_out_cap_dropped_bytes_reported = audio_out_cap_dropped_bytes;
+		audio_out_cap_last_log_ms = now_ms;
+	}
+}
+
+// SDL queue exceeded 3 device buffers (device stalled or resumed late): the SDL part
+// can only be cleared, the ring part is dropped with a crossfade down to the normal
+// top-up level. Called without the ring mutex held, from both PushAudioFrame (Takion
+// thread) and the drain thread after an unlocked size check: the check is repeated
+// under the ring mutex so one runaway is handled and counted once.
+void StreamSession::HandleAudioQueueRunaway()
+{
+	QMutexLocker locker(&audio_out_ring_mutex);
+	if(!audio_out || SDL_GetQueuedAudioSize(audio_out) <= 3 * audio_buffer_size)
+		return; // the other thread already cleared it (or the device is gone)
+	SDL_ClearQueuedAudio(audio_out);
+	const size_t keep = (size_t)audio_buffer_size * 2;
+	if(audio_out_ring_fill > keep)
+	{
+		size_t drop = audio_out_ring_fill - keep;
+		drop -= drop % audio_out_sample_size;
+		DropOldestAudioLocked(drop);
+	}
+	audio_out_overflow_logged = false;
+	audio_out_queue_clears++;
+
+	const uint64_t now_ms = chiaki_time_now_monotonic_ms();
+	if(!audio_out_queue_clear_last_log_ms || now_ms - audio_out_queue_clear_last_log_ms >= AUDIO_CAP_LOG_INTERVAL_MS)
+	{
+		CHIAKI_LOGI(log.GetChiakiLog(), "Audio queue exceeded latency threshold, cleared queued audio (%u times since last report, %u total)",
+			audio_out_queue_clears - audio_out_queue_clears_reported, audio_out_queue_clears);
+		audio_out_queue_clears_reported = audio_out_queue_clears;
+		audio_out_queue_clear_last_log_ms = now_ms;
+	}
+}
+
+void StreamSession::DropOldestAudioLocked(size_t drop)
+{
+	const size_t capacity = (size_t)audio_out_ring_buf.size();
+	// Callers must not ask for more than is queued; clamp in release builds so the
+	// ring never underflows and the caller's subsequent write fits.
+	Q_ASSERT(drop <= audio_out_ring_fill);
+	if(drop > audio_out_ring_fill)
+		drop = audio_out_ring_fill;
+	if(!capacity || !drop)
+		return;
+	char *ring = audio_out_ring_buf.data();
+	const size_t read_pos = audio_out_ring_read_pos;
+	nax5_audio_splice_s16([ring, read_pos, capacity](size_t offset) { return ring + (read_pos + offset) % capacity; },
+		audio_out_sample_size / sizeof(int16_t), audio_out_ring_fill, drop,
+		(size_t)(audio_out_rate * AUDIO_SPLICE_FADE_MS / 1000));
+	audio_out_ring_read_pos = (read_pos + drop) % capacity;
+	audio_out_ring_fill -= drop;
+}
+
+void StreamSession::TrimStandingAudioLocked(uint64_t now_ms, uint64_t queued)
+{
+	const unsigned int headroom_ms = nax5_audio_headroom_ms();
+	const size_t capacity = (size_t)audio_out_ring_buf.size();
+	if(!headroom_ms || !capacity)
+		return;
+
+	const Nax5AudioTrimParams params = {
+		AUDIO_TRIM_WINDOW_MS,
+		nax5_audio_bytes_for_ms(headroom_ms, audio_out_rate, audio_out_sample_size),
+		nax5_audio_bytes_for_ms(AUDIO_TRIM_HYSTERESIS_MS, audio_out_rate, audio_out_sample_size),
+		nax5_audio_bytes_for_ms(AUDIO_TRIM_STEP_MS, audio_out_rate, audio_out_sample_size),
+	};
+	uint64_t drop = nax5_audio_trim_update(audio_out_trim, params, now_ms, queued);
+	// Only the ring can be trimmed; whole sample frames keep channels aligned.
+	drop = qMin<uint64_t>(drop, audio_out_ring_fill);
+	drop -= drop % audio_out_sample_size;
+	if(!drop)
+		return;
+	DropOldestAudioLocked((size_t)drop);
+	audio_out_trim_dropped_bytes += drop;
+
+	if(!audio_out_trim_last_log_ms || now_ms - audio_out_trim_last_log_ms >= AUDIO_CAP_LOG_INTERVAL_MS)
+	{
+		const uint64_t bytes_per_s = nax5_audio_bytes_for_ms(1000, audio_out_rate, audio_out_sample_size);
+		const uint64_t since_last = audio_out_trim_dropped_bytes - audio_out_trim_dropped_bytes_reported;
+		CHIAKI_LOGI(log.GetChiakiLog(), "Audio latency trim: dropped %llu ms of standing audio since last report (queued %llu ms, headroom %u ms)",
+			(unsigned long long)(since_last * 1000 / bytes_per_s),
+			(unsigned long long)(queued * 1000 / bytes_per_s), headroom_ms);
+		audio_out_trim_dropped_bytes_reported = audio_out_trim_dropped_bytes;
+		audio_out_trim_last_log_ms = now_ms;
+	}
+}
+
+int StreamSession::GetAudioQueuedMs()
+{
+	QMutexLocker locker(&audio_out_ring_mutex);
+	if(!audio_out || !audio_out_rate || !audio_out_sample_size)
+		return 0;
+	const uint64_t queued = (uint64_t)SDL_GetQueuedAudioSize(audio_out) + audio_out_ring_fill;
+	return (int)(queued * 1000 / nax5_audio_bytes_for_ms(1000, audio_out_rate, audio_out_sample_size));
+}
+
 void StreamSession::DrainAudioOutRingBuffer()
 {
-	const size_t target_queue_size = audio_buffer_size * 2;
+	size_t target_queue_size = audio_buffer_size * 2;
+	// With a latency cap below the default top-up (~100 ms), keep the SDL queue under
+	// the cap too, so the excess stays in the ring where it can be trimmed.
+	if(nax5_audio_max_ms() && audio_out_rate && audio_out_sample_size)
+	{
+		size_t cap_bytes = (size_t)nax5_audio_bytes_for_ms(nax5_audio_max_ms(), audio_out_rate, audio_out_sample_size);
+		cap_bytes -= cap_bytes % audio_out_sample_size;
+		target_queue_size = qMin(target_queue_size, qMax((size_t)audio_buffer_size, cap_bytes));
+	}
 
+	bool first_poll = true;
 	while(audio_out)
 	{
 		if(SDL_GetQueuedAudioSize(audio_out) > 3 * audio_buffer_size)
-		{
-			CHIAKI_LOGW(log.GetChiakiLog(), "Audio queue exceeded latency threshold, clearing queued audio");
-			SDL_ClearQueuedAudio(audio_out);
-			QMutexLocker locker(&audio_out_ring_mutex);
-			audio_out_ring_read_pos = 0;
-			audio_out_ring_write_pos = 0;
-			audio_out_ring_fill = 0;
-			audio_out_overflow_logged = false;
-		}
+			HandleAudioQueueRunaway();
 
-		if(SDL_GetQueuedAudioSize(audio_out) >= target_queue_size)
+		const Uint32 sdl_queued = SDL_GetQueuedAudioSize(audio_out);
+		if(sdl_queued >= target_queue_size)
 			break;
 
 		QByteArray audio_chunk;
 		{
 			QMutexLocker locker(&audio_out_ring_mutex);
+			if(!audio_out)
+				return;
 			if(audio_out_ring_fill == 0)
 			{
 				audio_out_overflow_logged = false;
 				return;
 			}
+			// Device drained everything while data was still waiting in the ring
+			if(first_poll && sdl_queued == 0)
+				audio_out_starved_polls++;
+			first_poll = false;
 
 			size_t capacity = (size_t)audio_out_ring_buf.size();
-			size_t remaining_target = target_queue_size - SDL_GetQueuedAudioSize(audio_out);
+			size_t remaining_target = target_queue_size - sdl_queued;
 			size_t chunk_size = qMin(audio_out_ring_fill, qMin(remaining_target, capacity - audio_out_ring_read_pos));
+			// whole sample frames only, a partial frame would shift the channels
+			chunk_size -= chunk_size % audio_out_sample_size;
+			if(chunk_size == 0)
+				break; // queue is within a frame of the target, wait for the next pass
 			audio_chunk = QByteArray(audio_out_ring_buf.constData() + audio_out_ring_read_pos, (int)chunk_size);
 			audio_out_ring_read_pos = (audio_out_ring_read_pos + chunk_size) % capacity;
 			audio_out_ring_fill -= chunk_size;
@@ -2210,15 +2608,19 @@ void StreamSession::Event(ChiakiEvent *event)
 			connect_timer.invalidate();
 			connected = true;
 			emit ConnectedChanged();
+			emit PingChanged();
 			break;
 		case CHIAKI_EVENT_QUIT:
 			if(!connected && !holepunch_session && chiaki_quit_reason_is_error(event->quit.reason) && connect_timer.elapsed() < SESSION_RETRY_SECONDS * 1000)
 			{
-				QTimer::singleShot(SESSION_RETRY_SECONDS / 3, this, &StreamSession::Start);
+				// Upstream passed SESSION_RETRY_SECONDS / 3 (= 6) as milliseconds and hammered
+				// the console with ~150 session requests in 2 s while it was still busy.
+				QTimer::singleShot(nax5StreamRetryDelayMs(connect_timer.elapsed()), this, &StreamSession::Start);
 				return;
 			}
 			connected = false;
 			emit ConnectedChanged();
+			emit PingChanged();
 			emit SessionQuit(event->quit.reason, event->quit.reason_str ? QString::fromUtf8(event->quit.reason_str) : QString());
 			break;
 		case CHIAKI_EVENT_REGIST:
@@ -2276,15 +2678,11 @@ void StreamSession::Event(ChiakiEvent *event)
 			break;
 		}
 		case CHIAKI_EVENT_VIDEO_FEC_FAILURE: {
-			if(event->video_fec_failure.idr_request_sent)
-			{
-				CHIAKI_LOGW(log.GetChiakiLog(), "Video FEC failure, waiting for requested IDR");
-			}
-			else
-			{
-				CHIAKI_LOGW(log.GetChiakiLog(), "Video FEC failure, retrying IDR request after send failure");
+			// The lib already logs the failure; only count it here and retry the IDR
+			// request if the lib could not send one.
+			if(!event->video_fec_failure.idr_request_sent)
 				RequestIDR();
-			}
+			fec_failures.fetchAndAddRelaxed(1);
 			emit FecFailure();
 			break;
 		}
@@ -2634,6 +3032,11 @@ void StreamSession::TriggerFfmpegFrameAvailable()
 	{
 		measured_bitrate = session.stream_connection.measured_bitrate;
 		emit MeasuredBitrateChanged();
+	}
+	if(target_bitrate != session.stream_connection.target_bitrate)
+	{
+		target_bitrate = session.stream_connection.target_bitrate;
+		emit TargetBitrateChanged();
 	}
 }
 

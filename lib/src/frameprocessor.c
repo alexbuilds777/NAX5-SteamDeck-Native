@@ -56,6 +56,8 @@ CHIAKI_EXPORT void chiaki_frame_processor_init(ChiakiFrameProcessor *frame_proce
 	frame_processor->unit_slots_size = 0;
 	frame_processor->flushed = true;
 	chiaki_stream_stats_reset(&frame_processor->stream_stats);
+	frame_processor->frame_index = 0;
+	frame_processor->nax5_counters = NULL;
 }
 
 CHIAKI_EXPORT void chiaki_frame_processor_fini(ChiakiFrameProcessor *frame_processor)
@@ -73,6 +75,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_frame_processor_alloc_frame(ChiakiFrameProc
 	}
 
 	frame_processor->flushed = false;
+	frame_processor->frame_index = packet->frame_index;
 	frame_processor->units_source_expected = packet->units_in_frame_total - packet->units_in_frame_fec;
 	frame_processor->units_fec_expected = packet->units_in_frame_fec;
 	if(frame_processor->units_fec_expected < 1)
@@ -176,7 +179,10 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_frame_processor_put_unit(ChiakiFrameProcess
 	ChiakiFrameUnit *unit = frame_processor->unit_slots + packet->unit_index;
 	if(unit->data_size)
 	{
-		CHIAKI_LOGW(frame_processor->log, "Received duplicate unit");
+		// NAX5: normal with retransmits / reordering, counted instead of warned
+		CHIAKI_NAX5_INC(frame_processor->nax5_counters, pkts_dup);
+		CHIAKI_LOGV(frame_processor->log, "Received duplicate unit %u of frame %u",
+				(unsigned int)packet->unit_index, (unsigned int)packet->frame_index);
 		return CHIAKI_ERR_INVALID_DATA;
 	}
 
@@ -201,20 +207,30 @@ CHIAKI_EXPORT void chiaki_frame_processor_report_packet_stats(ChiakiFrameProcess
 	uint64_t received = frame_processor->units_source_received + frame_processor->units_fec_received;
 	uint64_t expected = frame_processor->units_source_expected + frame_processor->units_fec_expected;
 	chiaki_packet_stats_push_generation(packet_stats, received, expected - received);
+	// NAX5: non-resetting mirror of the same numbers
+	CHIAKI_NAX5_ADD(frame_processor->nax5_counters, units_rx, (uint32_t)received);
+	if(expected > received)
+		CHIAKI_NAX5_ADD(frame_processor->nax5_counters, units_lost, (uint32_t)(expected - received));
 }
 
 static ChiakiErrorCode chiaki_frame_processor_fec(ChiakiFrameProcessor *frame_processor)
 {
-	CHIAKI_LOGI(frame_processor->log, "Frame Processor received %u+%u / %u+%u units, attempting FEC",
+	// NAX5: counted and logged at debug level; the video receiver warns once if FEC fails
+	CHIAKI_NAX5_INC(frame_processor->nax5_counters, frames_fec_attempt);
+	CHIAKI_LOGD(frame_processor->log, "Frame %u: received %u+%u / %u+%u units, attempting FEC",
+				(unsigned int)frame_processor->frame_index,
 				frame_processor->units_source_received, frame_processor->units_fec_received,
 				frame_processor->units_source_expected, frame_processor->units_fec_expected);
-
 
 	size_t erasures_count = (frame_processor->units_source_expected + frame_processor->units_fec_expected)
 			- (frame_processor->units_source_received + frame_processor->units_fec_received);
 	unsigned int *erasures = calloc(erasures_count, sizeof(unsigned int));
 	if(!erasures)
+	{
+		// NAX5: keep frames_fec_attempt == frames_fec_ok + frames_fec_failed
+		CHIAKI_NAX5_INC(frame_processor->nax5_counters, frames_fec_failed);
 		return CHIAKI_ERR_MEMORY;
+	}
 
 	size_t erasure_index = 0;
 	for(size_t i=0; i<frame_processor->units_source_expected + frame_processor->units_fec_expected; i++)
@@ -227,6 +243,7 @@ static ChiakiErrorCode chiaki_frame_processor_fec(ChiakiFrameProcessor *frame_pr
 				// should never happen by design, but too scary not to check
 				assert(false);
 				free(erasures);
+				CHIAKI_NAX5_INC(frame_processor->nax5_counters, frames_fec_failed);
 				return CHIAKI_ERR_UNKNOWN;
 			}
 			erasures[erasure_index++] = (unsigned int)i;
@@ -242,12 +259,14 @@ static ChiakiErrorCode chiaki_frame_processor_fec(ChiakiFrameProcessor *frame_pr
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
 		err = CHIAKI_ERR_FEC_FAILED;
-		CHIAKI_LOGE(frame_processor->log, "FEC failed");
+		CHIAKI_NAX5_INC(frame_processor->nax5_counters, frames_fec_failed);
+		CHIAKI_LOGD(frame_processor->log, "Frame %u: FEC failed", (unsigned int)frame_processor->frame_index);
 	}
 	else
 	{
 		err = CHIAKI_ERR_SUCCESS;
-		CHIAKI_LOGI(frame_processor->log, "FEC successful");
+		CHIAKI_NAX5_INC(frame_processor->nax5_counters, frames_fec_ok);
+		CHIAKI_LOGD(frame_processor->log, "Frame %u: FEC successful", (unsigned int)frame_processor->frame_index);
 
 		// restore unit sizes
 		for(size_t i=0; i<frame_processor->units_source_expected; i++)
@@ -290,12 +309,17 @@ CHIAKI_EXPORT ChiakiFrameProcessorFlushResult chiaki_frame_processor_flush(Chiak
 	}
 
 	size_t cur = 0;
+	size_t missing_count = 0, missing_first = 0, missing_last = 0;
 	for(size_t i=0; i<frame_processor->units_source_expected; i++)
 	{
 		ChiakiFrameUnit *unit = frame_processor->unit_slots + i;
 		if(!unit->data_size)
 		{
-			CHIAKI_LOGW(frame_processor->log, "Missing unit %#llx", (unsigned long long)i);
+			// NAX5: one summary line per frame instead of one warning per unit
+			if(!missing_count)
+				missing_first = i;
+			missing_last = i;
+			missing_count++;
 			continue;
 		}
 		if(unit->data_size < 2)
@@ -309,6 +333,12 @@ CHIAKI_EXPORT ChiakiFrameProcessorFlushResult chiaki_frame_processor_flush(Chiak
 		memmove(frame_processor->frame_buf + cur, buf_ptr + 2, part_size);
 		cur += part_size;
 	}
+
+	if(missing_count)
+		CHIAKI_LOGW(frame_processor->log, "Frame %u: %llu of %u source units missing (first %#llx, last %#llx)",
+				(unsigned int)frame_processor->frame_index, (unsigned long long)missing_count,
+				frame_processor->units_source_expected,
+				(unsigned long long)missing_first, (unsigned long long)missing_last);
 
 	chiaki_stream_stats_frame(&frame_processor->stream_stats, (uint64_t)cur);
 

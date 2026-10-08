@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QElapsedTimer>
 #include <QObject>
 
 class SystemdInhibit : public QObject
@@ -26,4 +27,6 @@ private:
     QString what;
     QString mode;
     int fd = -1;
+    QElapsedTimer last_activity;
+    bool screensaver_missing = false;
 };

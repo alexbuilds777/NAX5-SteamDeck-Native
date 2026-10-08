@@ -47,6 +47,8 @@ set(SOURCE_FILES
 	src/nax5/nax5runtime.cpp
 	include/nax5/nax5processlog.h
 	src/nax5/nax5processlog.cpp
+	include/nax5/nax5singleinstance.h
+	src/nax5/nax5singleinstance.cpp
 	include/nax5/nax5networkhint.h
 	src/nax5/nax5networkhint.cpp
 	include/nax5/nax5clientreport.h
@@ -170,6 +172,28 @@ target_compile_definitions(chiaki PRIVATE
 	NAX5_CLIENT_SHA="${NAX5_CLIENT_SHA}"
 )
 
+# NAX5 build identity: nax5_build.h is (re)generated on every build from git so that
+# NAX5_BUILD_SHA / NAX5_BUILD_DESCRIBE follow the compiled tree, not the last configure.
+# The header is only rewritten when its content changes. Test targets deliberately do
+# not get NAX5_HAVE_BUILD_HEADER and keep the "testsha" compile definition.
+set(NAX5_BUILD_HEADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/nax5_build")
+set(NAX5_BUILD_HEADER "${NAX5_BUILD_HEADER_DIR}/nax5_build.h")
+add_custom_target(nax5-build-header
+	COMMAND ${CMAKE_COMMAND}
+		-DOUT=${NAX5_BUILD_HEADER}
+		-DSRC_DIR=${CMAKE_SOURCE_DIR}
+		"-DGIT=${GIT_EXECUTABLE}"
+		-DFALLBACK_SHA=${NAX5_CLIENT_SHA}
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/nax5_build_id.cmake
+	BYPRODUCTS ${NAX5_BUILD_HEADER}
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	COMMENT "NAX5: refreshing nax5_build.h from git"
+	VERBATIM
+)
+add_dependencies(chiaki nax5-build-header)
+target_include_directories(chiaki PRIVATE ${NAX5_BUILD_HEADER_DIR})
+target_compile_definitions(chiaki PRIVATE NAX5_HAVE_BUILD_HEADER)
+
 add_library(placebo-libav-impl src/libav_impl.c)
 target_link_libraries(placebo-libav-impl PkgConfig::LIBPLACEBO FFMPEG::avcodec FFMPEG::avutil FFMPEG::avformat)
 target_link_libraries(chiaki PkgConfig::LIBPLACEBO placebo-libav-impl)
@@ -251,7 +275,8 @@ if(CHIAKI_ENABLE_TESTS)
 		src/nax5/nax5authparser_test.cpp
 	)
 	target_include_directories(nax5-auth-unit PRIVATE include)
-	target_link_libraries(nax5-auth-unit Qt::Core)
+	find_package(OpenSSL REQUIRED)
+	target_link_libraries(nax5-auth-unit Qt::Core OpenSSL::Crypto)
 	add_test(NAME nax5-auth COMMAND nax5-auth-unit)
 
 	add_executable(nax5-session-unit
@@ -303,4 +328,10 @@ if(CHIAKI_ENABLE_TESTS)
 		target_link_libraries(nax5-telemetry-unit iphlpapi ws2_32 wlanapi)
 	endif()
 	add_test(NAME nax5-telemetry COMMAND nax5-telemetry-unit)
+
+	add_executable(nax5-audiotrim-unit
+		src/nax5/nax5audiotrim_test.cpp
+	)
+	target_include_directories(nax5-audiotrim-unit PRIVATE include)
+	add_test(NAME nax5-audiotrim COMMAND nax5-audiotrim-unit)
 endif()

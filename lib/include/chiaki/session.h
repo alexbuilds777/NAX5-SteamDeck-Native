@@ -17,6 +17,7 @@
 #include "remote/holepunch.h"
 #include "remote/rudp.h"
 #include "regist.h"
+#include "nax5counters.h"
 
 #include <stdint.h>
 
@@ -278,6 +279,9 @@ typedef struct chiaki_session_t
 	ChiakiStreamConnection stream_connection;
 
 	ChiakiControllerState controller_state;
+
+	// NAX5: lock-free stats counters (zeroed in chiaki_session_init)
+	ChiakiNax5Counters nax5_counters;
 } ChiakiSession;
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_init(ChiakiSession *session, ChiakiConnectInfo *connect_info, ChiakiLog *log);
@@ -287,6 +291,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_stop(ChiakiSession *session);
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_join(ChiakiSession *session);
 
 CHIAKI_EXPORT void chiaki_session_send_event(ChiakiSession *session, ChiakiEvent *event);
+
+/** NAX5: atomic snapshot of the session counters (safe from any thread while the session object lives). */
+CHIAKI_EXPORT void chiaki_session_get_nax5_counters(ChiakiSession *session, ChiakiNax5Counters *out);
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_request_idr(ChiakiSession *session);
 CHIAKI_EXPORT ChiakiErrorCode chiaki_session_set_controller_state(ChiakiSession *session, ChiakiControllerState *state);

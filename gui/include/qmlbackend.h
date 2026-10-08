@@ -8,6 +8,7 @@
 
 #include <QObject>
 #include <QMutex>
+#include <QPointer>
 #include <QThread>
 #include <QJSValue>
 #include <QSet>
@@ -187,6 +188,9 @@ public:
     bool zeroCopy()        { return !disable_zero_copy; };
     void disableZeroCopy() { disable_zero_copy = true; };
     void enableZeroCopy()  { disable_zero_copy = false; };
+    // NAX5: false from the moment a session is torn down (before sessionChanged(nullptr))
+    // until the next session is created. presentFrame must drop frames while false.
+    bool streamActive() const { return stream_active.loadAcquire() != 0; }
 
     Q_INVOKABLE void deleteHost(int index);
     Q_INVOKABLE void wakeUpHost(int index, QString nickname = QString());
@@ -294,6 +298,9 @@ private:
     void onNax5AuthStateChanged();
     void startNax5AutoConnectIfAllowed();
     QString getExecutable();
+    // NAX5: stop the frame thread from touching the session/decoder; call before
+    // session->deleteLater() at every teardown site.
+    void detachSessionFrames();
 
     Settings *settings = {};
     QmlSettings *settings_qml = {};
@@ -329,6 +336,14 @@ private:
     QSet<int> logged_hw_transfer_formats;
     QSet<int> logged_hw_transfer_failures;
     QAtomicInteger<int> pending_recovered_frame = 0;
+    // NAX5 frame-thread hand-off: the FfmpegFrameAvailable lambda runs on frame_thread
+    // and must never dereference a session the GUI thread is deleting. The decoder
+    // pointer is published together with a generation; the lambda holds
+    // frame_decoder_mutex while it works so detachSessionFrames() can wait it out.
+    QAtomicInteger<quint64> session_generation = 0;
+    QAtomicInteger<int> stream_active = 0;
+    QMutex frame_decoder_mutex;
+    ChiakiFfmpegDecoder *frame_decoder = nullptr;
     Controller *controller_mapping_controller = {};
     QMap<QString, QStringList> controller_guids_to_update = {};
     int controller_mapping_id = -1;

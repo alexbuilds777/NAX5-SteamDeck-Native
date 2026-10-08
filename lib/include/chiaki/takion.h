@@ -12,6 +12,7 @@
 #include "reorderqueue.h"
 #include "feedback.h"
 #include "takionsendbuffer.h"
+#include "nax5counters.h"
 
 #include <stdbool.h>
 
@@ -157,6 +158,7 @@ typedef struct chiaki_takion_t
 	bool video_queue_initialized;
 	int64_t video_queue_head_wait_start_us;
 	uint64_t video_queue_head_wait_seq_num;
+	int64_t av_reorder_timeout_us; // NAX5: set from NAX5_REORDER_TIMEOUT_US in chiaki_takion_connect
 	ChiakiTakionSendBuffer send_buffer;
 
 	ChiakiTakionCallback cb;
@@ -181,11 +183,33 @@ typedef struct chiaki_takion_t
 	ChiakiKeyState key_state;
 
 	bool enable_dualsense;
+
+	// NAX5: per-session counters sink, NULL until chiaki_takion_set_nax5_counters(). Read
+	// with an acquire load (see takion.c) because it is set after the Takion thread started.
+	ChiakiNax5Counters *nax5_counters;
+	// NAX5: re-ack burst limiter state (takion_nax5.h), Takion thread only.
+	uint64_t nax5_reack_last_us;
+	uint32_t nax5_reack_last_seq;
+	uint64_t nax5_reack_log_last_us;
+	// NAX5: set entries evicted from video_queue by the BEGIN drop strategy during one push
+	// (takion_av_drop), used to count the unset slots skipped with them. Takion thread only.
+	uint32_t nax5_av_evicted;
 } ChiakiTakion;
 
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, ChiakiTakionConnectInfo *info, chiaki_socket_t *sock);
 CHIAKI_EXPORT void chiaki_takion_close(ChiakiTakion *takion);
+
+/**
+ * NAX5: set the counters sink (may be NULL). Call right after a successful
+ * chiaki_takion_connect(): the Takion thread reads the pointer only once packets flow
+ * (after the handshake), and the store/loads are atomic so the handoff is race-free.
+ * chiaki_takion_connect() resets it to NULL.
+ */
+static inline void chiaki_takion_set_nax5_counters(ChiakiTakion *takion, ChiakiNax5Counters *counters)
+{
+	__atomic_store_n(&takion->nax5_counters, counters, __ATOMIC_RELEASE);
+}
 
 /**
  * Must be called from within the Takion thread, i.e. inside the callback!

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
 
 #include <controllermanager.h>
+#include <chiaki/time.h>
 
 #include <QCoreApplication>
 #include <QByteArray>
@@ -131,6 +132,21 @@ static ControllerManager *instance = nullptr;
 #define UPDATE_INTERVAL_MS 4
 #define MOVE_CHECK_MS 1000
 
+// NAX5: apply all SDL events of one poll pass to the controller state first and emit
+// Controller::StateChanged at most once per controller afterwards, so e.g. a diagonal
+// stick move becomes one feedback packet instead of two (the first with only one axis
+// updated). Discrete changes (buttons, L2/R2 press/release, touch start/stop) are never
+// merged away: the pending state is flushed before an event that could undo them.
+//   NAX5_COALESCE_INPUT=0  emit StateChanged for every SDL event (upstream behaviour)
+static bool nax5_coalesce_input()
+{
+	static const bool enabled = []() {
+		const QByteArray v = qgetenv("NAX5_COALESCE_INPUT");
+		return v.isEmpty() || v != "0";
+	}();
+	return enabled;
+}
+
 ControllerManager *ControllerManager::GetInstance()
 {
 	if(!instance)
@@ -242,6 +258,20 @@ void ControllerManager::creatingControllerMapping(bool creating_controller_mappi
 
 void ControllerManager::HandleEvents()
 {
+	if(handle_events_timer.isValid())
+	{
+		const qint64 gap_ms = handle_events_timer.restart();
+		if(gap_ms > UPDATE_INTERVAL_MS)
+		{
+			const quint32 stall = (quint32)(gap_ms - UPDATE_INTERVAL_MS);
+			quint32 cur = gui_stall_max_ms.loadRelaxed();
+			while(cur < stall && !gui_stall_max_ms.testAndSetRelaxed(cur, stall, cur)) {}
+		}
+	}
+	else
+		handle_events_timer.start();
+	prev_tick_start_us = cur_tick_start_us;
+	cur_tick_start_us = chiaki_time_now_monotonic_us();
 #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
 	SDL_Event event;
 	while(SDL_PollEvent(&event))
@@ -269,6 +299,15 @@ void ControllerManager::HandleEvents()
 					ControllerEvent(event);
 				break;
 		}
+	}
+
+	if(nax5_coalesce_input())
+	{
+		// Copy first: a StateChanged receiver may Unref a controller, which removes it
+		// from open_controllers (the object itself is only deleteLater()'d).
+		const auto controllers = open_controllers.values();
+		for(auto controller : controllers)
+			controller->FlushState();
 	}
 #endif
 }
@@ -358,7 +397,9 @@ void ControllerManager::ControllerClosed(Controller *controller)
 Controller::Controller(int device_id, ControllerManager *manager)
 : QObject(manager), ref(0), last_motion_timestamp(0), micbutton_push(false), is_dualsense(false),
   is_dualsense_edge(false), has_led(false), firmware_version(0), updating_mapping_button(false), is_handheld(false),
-  is_steam_virtual(false), is_steam_virtual_unmasked(false), enable_analog_stick_mapping(false)
+  is_steam_virtual(false), is_steam_virtual_unmasked(false), enable_analog_stick_mapping(false),
+  state_dirty(false), has_pending_event_poll(false), pending_event_poll_us(0),
+  has_emitted_event_poll(false), emitted_event_poll_us(0)
 {
 	this->id = device_id;
 	this->manager = manager;
@@ -366,6 +407,7 @@ Controller::Controller(int device_id, ControllerManager *manager)
 	chiaki_accel_new_zero_set_inactive(&this->accel_zero, false);
 	chiaki_accel_new_zero_set_inactive(&this->real_accel, true);
 	chiaki_controller_state_set_idle(&this->state);
+	chiaki_controller_state_set_idle(&this->emitted_state);
 
 #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
 	controller = nullptr;
@@ -434,9 +476,80 @@ void Controller::EnableAnalogStickMapping(bool enabled)
 	this->enable_analog_stick_mapping = enabled;
 }
 
+void Controller::FlushState()
+{
+	if(!state_dirty)
+		return;
+	state_dirty = false;
+	emitted_state = state;
+	has_emitted_event_poll = has_pending_event_poll;
+	emitted_event_poll_us = pending_event_poll_us;
+	has_pending_event_poll = false;
+	emit StateChanged();
+}
+
+bool Controller::TakeLastEventPollUs(quint64 *since_us)
+{
+	if(!has_emitted_event_poll)
+		return false;
+	has_emitted_event_poll = false;
+	*since_us = emitted_event_poll_us;
+	return true;
+}
+
 #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+// True if applying event on top of the not yet emitted state could hide a discrete
+// change from the receivers (lib feedback history and QmlController only see state
+// diffs), e.g. a button pressed and released within one poll pass.
+bool Controller::WouldUndoPendingChange(const SDL_Event &event)
+{
+	switch(event.type)
+	{
+		case SDL_CONTROLLERBUTTONDOWN:
+		case SDL_CONTROLLERBUTTONUP:
+			// Conservative: any further button event after a pending button change
+			return state.buttons != emitted_state.buttons;
+		case SDL_CONTROLLERAXISMOTION:
+		{
+			const uint8_t *pending;
+			uint8_t emitted;
+			if(event.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT)
+			{
+				pending = &state.l2_state;
+				emitted = emitted_state.l2_state;
+			}
+			else if(event.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT)
+			{
+				pending = &state.r2_state;
+				emitted = emitted_state.r2_state;
+			}
+			else
+				return false; // sticks are continuous, only the latest value matters
+			// L2/R2 go into the feedback history as analog button events: keep a
+			// press/release peak by flushing when the trigger reverses direction.
+			const uint8_t value = (uint8_t)(event.caxis.value >> 7);
+			return (*pending > emitted && value < *pending) || (*pending < emitted && value > *pending);
+		}
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+		case SDL_CONTROLLERTOUCHPADDOWN:
+		case SDL_CONTROLLERTOUCHPADUP:
+			for(size_t i=0; i<CHIAKI_CONTROLLER_TOUCHES_MAX; i++)
+			{
+				if(state.touches[i].id != emitted_state.touches[i].id)
+					return true;
+			}
+			return false;
+#endif
+		default:
+			return false;
+	}
+}
+
 void Controller::UpdateState(SDL_Event event)
 {
+	if(state_dirty && WouldUndoPendingChange(event))
+		FlushState();
+
 	switch(event.type)
 	{
 		case SDL_JOYAXISMOTION:
@@ -487,8 +600,26 @@ void Controller::UpdateState(SDL_Event event)
 			return;
 
 	}
-	emit StateChanged();
 	manager->moved = true;
+	// SDL2's event.common.timestamp is stamped inside the same SDL_PollEvent pass that
+	// delivers the event, so it only measures processing time. Use an honest upper bound
+	// instead: the event occurred at some point after the previous poll tick started.
+	// Keep the oldest one so a coalesced pass reports its worst-case latency.
+	if(!has_pending_event_poll && manager->prev_tick_start_us)
+	{
+		has_pending_event_poll = true;
+		pending_event_poll_us = manager->prev_tick_start_us;
+	}
+	if(nax5_coalesce_input())
+	{
+		// emitted by FlushState() at the end of ControllerManager::HandleEvents()
+		state_dirty = true;
+		return;
+	}
+	has_emitted_event_poll = has_pending_event_poll;
+	emitted_event_poll_us = pending_event_poll_us;
+	has_pending_event_poll = false;
+	emit StateChanged();
 }
 
 inline bool Controller::HandleButtonEvent(SDL_ControllerButtonEvent event) {
