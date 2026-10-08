@@ -1,0 +1,26 @@
+#!/bin/sh
+# Точка входа AppImage NAX5 для Steam Deck: готовит окружение и запускает клиент.
+HERE="$(dirname "$(readlink -f "$0")")"
+
+# Steam подставляет в LD_LIBRARY_PATH свой runtime; его библиотеки ломают нативную графику.
+if [ -n "$LD_LIBRARY_PATH" ]; then
+    clean=""
+    old_ifs=$IFS
+    IFS=:
+    for p in $LD_LIBRARY_PATH; do
+        case "$p" in
+            *"/Steam/ubuntu12"*|*steam-runtime*|*"/Steam/linux"*|"") ;;
+            *) clean="${clean:+$clean:}$p" ;;
+        esac
+    done
+    IFS=$old_ifs
+    export LD_LIBRARY_PATH="$clean"
+fi
+unset LD_PRELOAD
+
+# SDL перехватывает SIGTERM и превращает его в событие; клиент сам закрывается по TERM штатно.
+export SDL_NO_SIGNAL_HANDLERS="${SDL_NO_SIGNAL_HANDLERS:-1}"
+# Плагина Wayland в сборке нет: сразу X11 (XWayland в Game Mode и на рабочем столе).
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+
+exec "$HERE/usr/bin/chiaki" "$@"
